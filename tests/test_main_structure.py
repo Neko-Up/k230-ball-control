@@ -28,6 +28,17 @@ def test_detection_circle_geometry():
     assert detection_circle(1, 2, 2, 2) == (2, 3, 4)
 
 
+def test_three_sample_velocity_and_bounded_prediction():
+    estimate_velocity = load_pure_function("estimate_velocity")
+    predict_position = load_pure_function("predict_position")
+    samples = [(100, 50, 0), (104, 50, 20), (110, 52, 40)]
+    vx, vy = estimate_velocity(samples)
+    assert round(vx, 3) == 0.25
+    assert round(vy, 3) == 0.05
+    assert predict_position(110, 52, vx, vy, 40, 16) == (120, 54, False)
+    assert predict_position(110, 52, 1.0, 0.0, 40, 16) == (126, 52, True)
+
+
 def test_osd_updates_at_the_requested_cadence():
     should_render_osd = load_pure_function("should_render_osd")
     assert should_render_osd(1, 1) is True
@@ -139,6 +150,7 @@ def test_wifi_scan_supports_firmware_info_objects():
 
 if __name__ == "__main__":
     test_detection_circle_geometry()
+    test_three_sample_velocity_and_bounded_prediction()
     test_osd_updates_at_the_requested_cadence()
     test_control_ui_is_full_rate_and_rtc_is_removed()
     test_uart_updates_are_not_gated_by_osd_rendering()

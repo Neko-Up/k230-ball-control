@@ -101,6 +101,10 @@ DEDUP_IOU_THRESHOLD      = 0.35
 DEDUP_CENTER_RATIO       = 0.55
 TRACK_MERGE_IOU_THRESHOLD = 0.25
 TRACK_MERGE_CENTER_RATIO  = 0.75
+PREDICTION_HORIZON_MS     = 35
+PREDICTION_MIN_MS         = 20
+PREDICTION_MAX_MS         = 40
+PREDICTION_MAX_SHIFT_PX   = 16
 
 # ============================================================
 # 中值滤波
@@ -138,11 +142,63 @@ last_valid_cy     = -1
 tracks            = []
 frame_counter     = 0
 current_deviation = {"dx": 0, "dy": 0, "valid": False, "dist_mm": 0.0}
+control_state = {
+    "x": 0, "y": 0, "vx": 0.0, "vy": 0.0,
+    "valid": False, "source": "none", "timestamp_ms": 0,
+}
+motion_samples = []
 
 
 # ============================================================
 # 工具函数
 # ============================================================
+
+def estimate_velocity(samples):
+    if len(samples) < 2:
+        return 0.0, 0.0
+    velocities = []
+    for index in range(1, len(samples)):
+        x0, y0, t0 = samples[index - 1]
+        x1, y1, t1 = samples[index]
+        dt = t1 - t0
+        if dt > 0:
+            velocities.append(((x1 - x0) / dt, (y1 - y0) / dt))
+    if not velocities:
+        return 0.0, 0.0
+    return (
+        sum(item[0] for item in velocities) / len(velocities),
+        sum(item[1] for item in velocities) / len(velocities),
+    )
+
+
+def predict_position(x, y, vx, vy, horizon_ms, max_shift_px):
+    shift_x = vx * horizon_ms
+    shift_y = vy * horizon_ms
+    clamped = abs(shift_x) > max_shift_px or abs(shift_y) > max_shift_px
+    shift_x = max(-max_shift_px, min(max_shift_px, shift_x))
+    shift_y = max(-max_shift_px, min(max_shift_px, shift_y))
+    return int(round(x + shift_x)), int(round(y + shift_y)), clamped
+
+
+def publish_measurement(x, y, source, now_ms):
+    global control_state, motion_samples
+    motion_samples = (motion_samples + [(x, y, now_ms)])[-3:]
+    vx, vy = estimate_velocity(motion_samples)
+    pred_x, pred_y, _ = predict_position(
+        x, y, vx, vy, PREDICTION_HORIZON_MS, PREDICTION_MAX_SHIFT_PX)
+    control_state = {
+        "x": pred_x, "y": pred_y, "vx": vx, "vy": vy,
+        "valid": True, "source": source, "timestamp_ms": now_ms,
+    }
+
+
+def invalidate_control_state():
+    global control_state, motion_samples
+    motion_samples = []
+    control_state = {
+        "x": 0, "y": 0, "vx": 0.0, "vy": 0.0,
+        "valid": False, "source": "none", "timestamp_ms": 0,
+    }
 
 def two_side_pad_param(input_size, output_size):
     ratio_w = output_size[0] / input_size[0]
