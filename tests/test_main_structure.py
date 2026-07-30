@@ -768,6 +768,122 @@ def test_rtsp_void_and_zero_returns_are_successful():
     assert rtsp_call_succeeded(-1) is False
 
 
+def test_rtsp_worker_isolated_from_control_outputs_and_startup_is_guarded():
+    rtsp_server = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.ClassDef)
+        and item.name == "LowLatencyRtspH264Server"
+    )
+    methods = {
+        item.name: item
+        for item in rtsp_server.body
+        if isinstance(item, ast.FunctionDef)
+    }
+    stream_loop = methods["_stream_loop"]
+    start = methods["start"]
+
+    thread_calls = [
+        call
+        for call in ast.walk(start)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "_thread"
+        and call.func.attr == "start_new_thread"
+    ]
+    assert len(thread_calls) == 1
+    assert isinstance(thread_calls[0].args[0], ast.Attribute)
+    assert isinstance(thread_calls[0].args[0].value, ast.Name)
+    assert thread_calls[0].args[0].value.id == "self"
+    assert thread_calls[0].args[0].attr == "_stream_loop"
+
+    guarded_thread_start = any(
+        thread_calls[0] in ast.walk(branch)
+        for branch in ast.walk(start)
+        if isinstance(branch, ast.Try) and branch.handlers
+    )
+    assert guarded_thread_start
+
+    forbidden_calls = []
+    for call in (
+            node for node in ast.walk(stream_loop)
+            if isinstance(node, ast.Call)):
+        if isinstance(call.func, ast.Name):
+            forbidden_calls.append(call.func.id)
+        elif isinstance(call.func, ast.Attribute):
+            forbidden_calls.append(call.func.attr)
+    assert "publish_measurement" not in forbidden_calls
+    assert "update_servo_control" not in forbidden_calls
+    assert "write" not in forbidden_calls
+
+
+def test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting():
+    assignments = {
+        target.id: ast.literal_eval(item.value)
+        for item in TREE.body
+        if isinstance(item, ast.Assign)
+        for target in item.targets
+        if isinstance(target, ast.Name)
+        and target.id in {
+            "METRICS_EVERY_N_CONTROL_FRAMES",
+            "blob_frame_count", "blob_total_ms",
+            "kpu_validation_count", "kpu_total_ms",
+            "blob_loss_count", "kpu_reacquire_count",
+            "prediction_clamp_count",
+        }
+    }
+    assert assignments == {
+        "METRICS_EVERY_N_CONTROL_FRAMES": 60,
+        "blob_frame_count": 0,
+        "blob_total_ms": 0,
+        "kpu_validation_count": 0,
+        "kpu_total_ms": 0,
+        "blob_loss_count": 0,
+        "kpu_reacquire_count": 0,
+        "prediction_clamp_count": 0,
+    }
+
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    metric_prints = [
+        call
+        for call in ast.walk(detection)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "print"
+        and any(
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and "TRACK:" in value.value
+            and "CTRL:" in value.value
+            and "Blob:" in value.value
+            and "KPU:" in value.value
+            and "Lost:" in value.value
+            and "Reacq:" in value.value
+            and "Clamp:" in value.value
+            for value in ast.walk(call)
+        )
+    ]
+    assert len(metric_prints) == 1
+
+    metric_guards = [
+        branch
+        for branch in ast.walk(detection)
+        if isinstance(branch, ast.If)
+        and any(
+            isinstance(name, ast.Name)
+            and name.id == "METRICS_EVERY_N_CONTROL_FRAMES"
+            for name in ast.walk(branch.test)
+        )
+    ]
+    assert len(metric_guards) == 1
+    assert metric_prints[0] in ast.walk(metric_guards[0])
+
+
 def test_wifi_scan_supports_firmware_info_objects():
     wifi_scan_channel_rssi = load_pure_function("wifi_scan_channel_rssi")
 
@@ -809,5 +925,7 @@ if __name__ == "__main__":
     test_h264_rtsp_replaces_mjpeg_transport()
     test_control_interface_and_model_paths_are_unchanged()
     test_rtsp_void_and_zero_returns_are_successful()
+    test_rtsp_worker_isolated_from_control_outputs_and_startup_is_guarded()
+    test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting()
     test_wifi_scan_supports_firmware_info_objects()
     print("tests: OK")

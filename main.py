@@ -91,6 +91,7 @@ MAX_DETECTIONS_PER_FRAME = 25
 PRINT_EVERY_N_FRAMES     = 30
 GC_EVERY_N_FRAMES        = 60      # 降低强制 GC 频率，减少周期性停顿
 PERF_EVERY_N_FRAMES      = 60      # 低频统计实际 AI 主循环性能
+METRICS_EVERY_N_CONTROL_FRAMES = 60
 OSD_EVERY_N_FRAMES       = 1       # 控制/UART 全帧运行，叠加层每帧刷新
 DISPLAY_LABEL            = "gz"
 MERGED_CLASS_ID          = 0       # 新模型只有 gangqiu 一个类
@@ -163,6 +164,13 @@ control_state = {
     "valid": False, "source": "none", "timestamp_ms": 0,
 }
 motion_samples = []
+blob_frame_count = 0
+blob_total_ms = 0
+kpu_validation_count = 0
+kpu_total_ms = 0
+blob_loss_count = 0
+kpu_reacquire_count = 0
+prediction_clamp_count = 0
 
 
 # ============================================================
@@ -243,13 +251,16 @@ def hybrid_frame_actions(state, frame_number, blob_available):
 
 
 def prediction_for_missed_frame(current_state, predicted_frames, now_ms):
+    global prediction_clamp_count
     if (not current_state["valid"] or
             predicted_frames >= PREDICT_ONLY_MAX_FRAMES):
         return None, predicted_frames
-    pred_x, pred_y, _ = predict_position(
+    pred_x, pred_y, clamped = predict_position(
         current_state["x"], current_state["y"],
         current_state["vx"], current_state["vy"],
         PREDICTION_HORIZON_MS, PREDICTION_MAX_SHIFT_PX)
+    if clamped:
+        prediction_clamp_count += 1
     return ({
         "x": pred_x, "y": pred_y,
         "vx": current_state["vx"], "vy": current_state["vy"],
@@ -258,11 +269,13 @@ def prediction_for_missed_frame(current_state, predicted_frames, now_ms):
 
 
 def publish_measurement(x, y, source, now_ms):
-    global control_state, motion_samples
+    global control_state, motion_samples, prediction_clamp_count
     motion_samples = (motion_samples + [(x, y, now_ms)])[-3:]
     vx, vy = estimate_velocity(motion_samples)
-    pred_x, pred_y, _ = predict_position(
+    pred_x, pred_y, clamped = predict_position(
         x, y, vx, vy, PREDICTION_HORIZON_MS, PREDICTION_MAX_SHIFT_PX)
+    if clamped:
+        prediction_clamp_count += 1
     control_state = {
         "x": pred_x, "y": pred_y, "vx": vx, "vy": vy,
         "valid": True, "source": source, "timestamp_ms": now_ms,
@@ -1243,6 +1256,10 @@ def draw_osd(osd_img, capture, color_four, uart_obj, render_osd=True):
 
 def detection():
     global state, tracker_state, control_state, motion_samples
+    global blob_frame_count, blob_total_ms
+    global kpu_validation_count, kpu_total_ms
+    global blob_loss_count, kpu_reacquire_count
+    global prediction_clamp_count
     print("=== Ball Position (new model) ===")
     wlan = None
 
@@ -1305,6 +1322,14 @@ def detection():
     gc_frame_count = 0
     perf_frame_count = 0
     perf_start_ms = time.ticks_ms()
+    metrics_start_ms = time.ticks_ms()
+    blob_frame_count = 0
+    blob_total_ms = 0
+    kpu_validation_count = 0
+    kpu_total_ms = 0
+    blob_loss_count = 0
+    kpu_reacquire_count = 0
+    prediction_clamp_count = 0
     blob_misses = 0
     ai_failures = 0
     predicted_frames = 0
@@ -1317,11 +1342,15 @@ def detection():
                 dynamic_roi = blob_tracking_roi(control_state["x"])
                 blob_capture = None
                 if blob_channel_available:
+                    blob_start_ms = time.ticks_ms()
                     blob_capture, blob_channel_available = (
                         snapshot_blob_channel(
                             sensor, tracker_state == TRACK_ACTIVE,
                             dynamic_roi,
                             control_state["x"], control_state["y"]))
+                    blob_frame_count += 1
+                    blob_total_ms += time.ticks_diff(
+                        time.ticks_ms(), blob_start_ms)
                     if not blob_channel_available:
                         tracker_state = TRACK_SEARCH
                         blob_misses = 0
@@ -1350,6 +1379,7 @@ def detection():
                             blob_misses = 0
                             predicted_frames = 0
                         else:
+                            blob_loss_count += 1
                             blob_misses += 1
                             predicted_state, predicted_frames = (
                                 prediction_for_missed_frame(
@@ -1374,6 +1404,7 @@ def detection():
                     out_data = None
                     result = None
                     det_boxes = None
+                    kpu_start_ms = time.ticks_ms()
                     try:
                         rgb888p_img = sensor.snapshot(
                             chn=CAM_CHN_ID_2, timeout=2000)
@@ -1426,7 +1457,13 @@ def detection():
                         del ai2d_input
                         del rgb888p_img
 
+                    kpu_validation_count += 1
+                    kpu_total_ms += time.ticks_diff(
+                        time.ticks_ms(), kpu_start_ms)
+
                     ai_valid = capture is not None
+                    if ai_valid and tracker_state == TRACK_RECOVER:
+                        kpu_reacquire_count += 1
                     validation_only = (
                         blob_channel_available and
                         tracker_state == TRACK_ACTIVE)
@@ -1500,6 +1537,39 @@ def detection():
                     blob_misses = 0
                     ai_failures = 0
                     predicted_frames = 0
+
+                if (frame_counter % METRICS_EVERY_N_CONTROL_FRAMES == 0):
+                    metrics_now_ms = time.ticks_ms()
+                    metrics_elapsed_ms = time.ticks_diff(
+                        metrics_now_ms, metrics_start_ms)
+                    control_fps = 0.0
+                    if metrics_elapsed_ms > 0:
+                        control_fps = (
+                            METRICS_EVERY_N_CONTROL_FRAMES * 1000.0 /
+                            metrics_elapsed_ms)
+                    blob_avg_ms = 0.0
+                    if blob_frame_count > 0:
+                        blob_avg_ms = (
+                            blob_total_ms * 1.0 / blob_frame_count)
+                    kpu_avg_ms = 0.0
+                    if kpu_validation_count > 0:
+                        kpu_avg_ms = (
+                            kpu_total_ms * 1.0 / kpu_validation_count)
+                    print(
+                        "TRACK:{} CTRL:{:.1f} Blob:{:.1f} KPU:{:.1f} "
+                        "Lost:{} Reacq:{} Clamp:{}".format(
+                            tracker_state, control_fps, blob_avg_ms,
+                            kpu_avg_ms, blob_loss_count,
+                            kpu_reacquire_count,
+                            prediction_clamp_count))
+                    metrics_start_ms = metrics_now_ms
+                    blob_frame_count = 0
+                    blob_total_ms = 0
+                    kpu_validation_count = 0
+                    kpu_total_ms = 0
+                    blob_loss_count = 0
+                    kpu_reacquire_count = 0
+                    prediction_clamp_count = 0
 
                 gc_frame_count += 1
                 if gc_frame_count >= GC_EVERY_N_FRAMES:
