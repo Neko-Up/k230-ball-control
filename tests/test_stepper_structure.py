@@ -21,6 +21,7 @@ def test_d36a_pin_assignment_matches_k230_header():
     assert assigned_value("STEPPER_PWM_CHANNEL") == 0
     assert assigned_value("STEPPER_DIR_IO") == 5
     assert assigned_value("STEPPER_EN_IO") == 6
+    assert assigned_value("STEPPER_WATCHDOG_TIMER_ID") == -1
 
 
 def test_d36a_adapter_owns_pwm_direction_and_active_high_enable():
