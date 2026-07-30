@@ -197,11 +197,16 @@ def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
             and expression.func.attr == "UART"
         )
 
-    def register_local_function(node, environment, class_name):
+    def register_local_function(node, environment, instance_state,
+                                class_name):
         key = ("local", id(node))
         node_by_key[key] = node
         local_class_names[key] = class_name
-        local_defining_scopes[key] = environment_scopes[id(environment)]
+        defining_scope = environment_scopes[id(environment)]
+        if defining_scope["environment"] is not environment:
+            defining_scope = new_environment_scope(
+                environment, instance_state)
+        local_defining_scopes[key] = defining_scope
         environment[node.name] = {key}
 
     def analyze_expression(expression, environment, instance_state,
@@ -297,7 +302,7 @@ def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
                         default, environment, instance_state,
                         class_name, active)
                 register_local_function(
-                    statement, environment, class_name)
+                    statement, environment, instance_state, class_name)
                 continue
             if isinstance(statement, (ast.ClassDef, ast.AsyncFunctionDef)):
                 continue
@@ -1789,6 +1794,78 @@ class Worker:
         safe_tree, "Worker", "_stream_loop") == set()
 
 
+def test_rtsp_call_graph_captures_unsafe_compound_closure_alias_state():
+    tree = ast.parse(
+        """
+def invoke_helper(callback):
+    callback()
+
+def send_packet():
+    return None
+
+class Worker:
+    def _stream_loop(self):
+        callback = send_packet
+        if enabled:
+            callback = publish_measurement
+
+            def invoke():
+                callback()
+
+            invoke_helper(invoke)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"publish_measurement"}
+
+
+def test_rtsp_call_graph_keeps_safe_compound_closure_alias_state():
+    tree = ast.parse(
+        """
+def invoke_helper(callback):
+    callback()
+
+def send_packet():
+    return None
+
+class Worker:
+    def _stream_loop(self):
+        callback = publish_measurement
+        if enabled:
+            callback = send_packet
+
+            def invoke():
+                callback()
+
+            invoke_helper(invoke)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == set()
+
+
+def test_rtsp_call_graph_captures_compound_closure_self_attr_state():
+    tree = ast.parse(
+        """
+def invoke_helper(callback):
+    callback()
+
+def send_packet():
+    return None
+
+class Worker:
+    def _stream_loop(self):
+        self.callback = send_packet
+        if enabled:
+            self.callback = publish_measurement
+
+            def invoke():
+                self.callback()
+
+            invoke_helper(invoke)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"publish_measurement"}
+
+
 def test_rtsp_call_graph_preserves_foreign_state_within_nested_calls():
     tree = ast.parse(
         """
@@ -2036,6 +2113,9 @@ if __name__ == "__main__":
     test_rtsp_call_graph_keeps_foreign_instance_state_separate()
     test_rtsp_call_graph_seeds_known_module_uart_roots()
     test_rtsp_call_graph_keeps_lexical_closure_through_helper_invocation()
+    test_rtsp_call_graph_captures_unsafe_compound_closure_alias_state()
+    test_rtsp_call_graph_keeps_safe_compound_closure_alias_state()
+    test_rtsp_call_graph_captures_compound_closure_self_attr_state()
     test_rtsp_call_graph_preserves_foreign_state_within_nested_calls()
     test_rtsp_call_graph_keeps_captured_self_state_through_helper()
     test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting()
