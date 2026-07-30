@@ -97,6 +97,18 @@ class GreenPipeGeometryTests(unittest.TestCase):
         state = update(state, None, 2, 1.0)
         self.assertFalse(state["valid"])
 
+    def test_first_pipe_geometry_is_locked_until_restart(self):
+        first = self.geometry["pipe_geometry_from_corners"](
+            [(100, 100), (500, 100), (500, 140), (100, 140)])
+        jittered = self.geometry["pipe_geometry_from_corners"](
+            [(112, 108), (512, 108), (512, 148), (112, 148)])
+        update = self.geometry["update_pipe_geometry_state"]
+        state = update({"valid": False, "geometry": None, "misses": 0},
+                       first, 2, 1.0, True)
+        self.assertTrue(state["locked"])
+        locked = update(state, jittered, 2, 1.0, True)
+        self.assertEqual(locked["geometry"]["center"], first["center"])
+
 
 if __name__ == "__main__":
     unittest.main()

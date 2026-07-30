@@ -126,6 +126,7 @@ PIPE_MIN_ASPECT_RATIO     = 3.0
 PIPE_LENGTH_CM            = 25.0
 PIPE_HOLD_MISSES          = 3
 PIPE_SMOOTH_ALPHA         = 0.85
+PIPE_LOCK_FIRST           = True
 TRACK_SEARCH              = "SEARCH"
 TRACK_ACTIVE              = "TRACK"
 TRACK_RECOVER             = "RECOVER"
@@ -171,6 +172,7 @@ pipe_state = {
     "valid": False,
     "geometry": None,
     "misses": 0,
+    "locked": False,
 }
 motion_samples = []
 blob_frame_count = 0
@@ -447,7 +449,16 @@ def detect_blob_measurement(img, dynamic_roi,
 
 
 def update_pipe_geometry_state(previous, observation,
-                               hold_misses=3, smooth_alpha=0.85):
+                               hold_misses=3, smooth_alpha=0.85,
+                               lock_first=False):
+    if (lock_first and previous.get("locked") and
+            previous.get("geometry") is not None):
+        return {
+            "valid": True,
+            "geometry": previous["geometry"],
+            "misses": 0,
+            "locked": True,
+        }
     if observation is None:
         misses = int(previous.get("misses", 0)) + 1
         return {
@@ -455,6 +466,7 @@ def update_pipe_geometry_state(previous, observation,
                      misses <= hold_misses,
             "geometry": previous.get("geometry"),
             "misses": misses,
+            "locked": bool(previous.get("locked", False)),
         }
     geometry = observation
     previous_geometry = previous.get("geometry")
@@ -471,7 +483,12 @@ def update_pipe_geometry_state(previous, observation,
         blended = pipe_geometry_from_corners(blended_corners)
         if blended is not None:
             geometry = blended
-    return {"valid": True, "geometry": geometry, "misses": 0}
+    return {
+        "valid": True,
+        "geometry": geometry,
+        "misses": 0,
+        "locked": bool(lock_first),
+    }
 
 
 def pipe_corners_from_pose(center_x, center_y, ux, uy,
@@ -540,7 +557,7 @@ def detect_green_pipe(img):
 
 
 def snapshot_blob_channel(sensor, should_detect, dynamic_roi,
-                          expected_x, expected_y):
+                          expected_x, expected_y, detect_pipe=True):
     if not should_detect:
         return None, None, True
     blob_img = None
@@ -548,7 +565,7 @@ def snapshot_blob_channel(sensor, should_detect, dynamic_roi,
         blob_img = sensor.snapshot(chn=CAM_CHN_ID_1, timeout=2000)
         ball_capture = detect_blob_measurement(
             blob_img, dynamic_roi, expected_x, expected_y)
-        pipe_geometry = detect_green_pipe(blob_img)
+        pipe_geometry = detect_green_pipe(blob_img) if detect_pipe else None
         return ball_capture, pipe_geometry, True
     except Exception as e:
         print("Blob channel unavailable; KPU fallback active:", e)
@@ -1824,7 +1841,8 @@ def detection():
                         snapshot_blob_channel(
                             sensor, True,
                             dynamic_roi,
-                            roi_anchor["x"], roi_anchor["y"]))
+                            roi_anchor["x"], roi_anchor["y"],
+                            not pipe_state.get("locked", False)))
                     blob_frame_count += 1
                     blob_total_ms += time.ticks_diff(
                         time.ticks_ms(), blob_start_ms)
@@ -1836,7 +1854,8 @@ def detection():
                         motion_samples = []
                 pipe_state = update_pipe_geometry_state(
                     pipe_state, pipe_observation,
-                    PIPE_HOLD_MISSES, PIPE_SMOOTH_ALPHA)
+                    PIPE_HOLD_MISSES, PIPE_SMOOTH_ALPHA,
+                    PIPE_LOCK_FIRST)
 
                 blob_valid = blob_capture is not None
                 if (blob_channel_available and
