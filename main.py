@@ -252,6 +252,106 @@ def detect_blob_measurement(img, dynamic_roi):
     return select_blob_candidate(candidates, expected_x, expected_y)
 
 
+def configure_camera_sensor(sensor, enable_blob_channel):
+    sensor.reset()
+    sensor.set_hmirror(False)
+    sensor.set_vflip(False)
+    sensor.set_framesize(width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT)
+    sensor.set_pixformat(PIXEL_FORMAT_YUV_SEMIPLANAR_420)
+    sensor.set_framesize(
+        width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
+        chn=CAM_CHN_ID_2)
+    sensor.set_pixformat(
+        PIXEL_FORMAT_RGB_888_PLANAR, chn=CAM_CHN_ID_2)
+    if enable_blob_channel:
+        sensor.set_framesize(
+            width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
+            chn=CAM_CHN_ID_1)
+        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
+    return sensor
+
+
+def create_camera_sensor(enable_blob_channel):
+    sensor = None
+    last_sensor_error = None
+    for probe_attempt in range(1, CAMERA_PROBE_RETRIES + 1):
+        try:
+            sensor = Sensor(id=CAMERA_CSI_ID, fps=30)
+            break
+        except RuntimeError as e:
+            last_sensor_error = e
+            print("Camera probe {}/{} failed: {}".format(
+                probe_attempt, CAMERA_PROBE_RETRIES, e))
+            gc.collect()
+            time.sleep_ms(1500)
+    if sensor is None:
+        raise last_sensor_error
+    try:
+        return configure_camera_sensor(sensor, enable_blob_channel)
+    except BaseException:
+        cleanup_camera_start(sensor, False, False)
+        raise
+
+
+def cleanup_camera_start(sensor, display_started, media_attempted):
+    if sensor is not None:
+        try:
+            sensor.stop(is_del=True)
+        except TypeError:
+            try:
+                sensor.stop()
+            except BaseException:
+                pass
+        except BaseException:
+            pass
+    if display_started:
+        try:
+            Display.deinit()
+        except BaseException:
+            pass
+    if media_attempted:
+        try:
+            MediaManager.deinit()
+        except BaseException:
+            pass
+
+
+def start_camera_pipeline(enable_blob_channel):
+    sensor = None
+    display_started = False
+    media_attempted = False
+    try:
+        sensor = create_camera_sensor(enable_blob_channel)
+        sensor_bind_info = sensor.bind_info(x=0, y=0, chn=CAM_CHN_ID_0)
+        Display.bind_layer(**sensor_bind_info, layer=Display.LAYER_VIDEO1)
+        display_started = True
+        if display_mode == "lcd":
+            Display.init(Display.ST7701, to_ide=False)
+        else:
+            Display.init(Display.LT9611, to_ide=False)
+        osd_img = image.Image(
+            DISPLAY_WIDTH, DISPLAY_HEIGHT, image.ARGB8888)
+        rtsp_server = LowLatencyRtspH264Server(
+            Display.width(), Display.height(), RTSP_PORT, RTSP_SESSION)
+        media_attempted = True
+        MediaManager.init()
+        sensor.run()
+        return sensor, osd_img, rtsp_server
+    except BaseException:
+        cleanup_camera_start(sensor, display_started, media_attempted)
+        raise
+
+
+def start_camera_with_blob_fallback(start_attempt):
+    try:
+        sensor, osd_img, rtsp_server = start_attempt(True)
+        return sensor, osd_img, rtsp_server, True
+    except BaseException:
+        print("Blob channel unavailable; KPU fallback active")
+        sensor, osd_img, rtsp_server = start_attempt(False)
+        return sensor, osd_img, rtsp_server, False
+
+
 def two_side_pad_param(input_size, output_size):
     ratio_w = output_size[0] / input_size[0]
     ratio_h = output_size[1] / input_size[1]
@@ -1078,51 +1178,8 @@ def detection():
     # 部分 K230 板型默认以 60 FPS 启动；显示和 AI 同时工作时
     # 会导致 snapshot chn(2) failed(3)。固定 30 FPS 可避免缓冲区耗尽。
     time.sleep_ms(CAMERA_BOOT_DELAY_MS)
-    sensor = None
-    last_sensor_error = None
-    for probe_attempt in range(1, CAMERA_PROBE_RETRIES + 1):
-        try:
-            sensor = Sensor(id=CAMERA_CSI_ID, fps=30)
-            break
-        except RuntimeError as e:
-            last_sensor_error = e
-            print("Camera probe {}/{} failed: {}".format(
-                probe_attempt, CAMERA_PROBE_RETRIES, e))
-            gc.collect()
-            time.sleep_ms(1500)
-    if sensor is None:
-        raise last_sensor_error
-    sensor.reset()
-    sensor.set_hmirror(False)
-    sensor.set_vflip(False)
-    sensor.set_framesize(width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT)
-    sensor.set_pixformat(PIXEL_FORMAT_YUV_SEMIPLANAR_420)
-    # chn0 用于 LCD，chn1 用于 Blob，chn2 用于 AI。
-    sensor.set_framesize(width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
-                         chn=CAM_CHN_ID_2)
-    sensor.set_pixformat(PIXEL_FORMAT_RGB_888_PLANAR, chn=CAM_CHN_ID_2)
-    blob_channel_available = False
-    try:
-        sensor.set_framesize(
-            width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
-            chn=CAM_CHN_ID_1)
-        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
-        blob_channel_available = True
-    except BaseException:
-        print("Blob channel unavailable; KPU fallback active")
-
-    # ---- 显示屏 ----
-    sensor_bind_info = sensor.bind_info(x=0, y=0, chn=CAM_CHN_ID_0)
-    Display.bind_layer(**sensor_bind_info, layer=Display.LAYER_VIDEO1)
-    if display_mode == "lcd":
-        Display.init(Display.ST7701, to_ide=False)
-    else:
-        Display.init(Display.LT9611, to_ide=False)
-    osd_img = image.Image(DISPLAY_WIDTH, DISPLAY_HEIGHT, image.ARGB8888)
-    rtsp_server = LowLatencyRtspH264Server(
-        Display.width(), Display.height(), RTSP_PORT, RTSP_SESSION)
-    MediaManager.init()
-    sensor.run()
+    sensor, osd_img, rtsp_server, blob_channel_available = (
+        start_camera_with_blob_fallback(start_camera_pipeline))
 
     print("Creating AI output tensor")
     data = np.ones((1,3,kmodel_frame_size[1],kmodel_frame_size[0]), dtype=np.uint8)

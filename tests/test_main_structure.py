@@ -118,69 +118,227 @@ def test_blob_detection_returns_plain_candidate_from_requested_roi():
 
 
 def test_blob_channel_is_best_effort_and_configured_before_media_init():
-    detection = next(
-        item
-        for item in TREE.body
-        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    events = []
+    sensors = []
+
+    class FakeSensorType:
+        RGB565 = "rgb565"
+
+    class FakeSensor:
+        def __init__(self, enable_blob_channel):
+            self.enable_blob_channel = enable_blob_channel
+            self.channels = set()
+            sensors.append(self)
+
+        def reset(self):
+            events.append(("reset", self.enable_blob_channel))
+
+        def set_hmirror(self, value):
+            pass
+
+        def set_vflip(self, value):
+            pass
+
+        def set_framesize(self, **kwargs):
+            self.channels.add(kwargs.get("chn", 0))
+
+        def set_pixformat(self, pixel_format, chn=0):
+            self.channels.add(chn)
+
+        def bind_info(self, **kwargs):
+            events.append(("bind_info", self.enable_blob_channel))
+            return {"src": self.enable_blob_channel}
+
+        def run(self):
+            events.append(("sensor_run", self.enable_blob_channel))
+            if self.enable_blob_channel:
+                raise RuntimeError("deferred channel 1 failure")
+
+        def stop(self, is_del=False):
+            events.append(("sensor_stop", self.enable_blob_channel, is_del))
+
+    class FakeDisplay:
+        ST7701 = "lcd"
+        LT9611 = "hdmi"
+        LAYER_VIDEO1 = 1
+
+        @staticmethod
+        def bind_layer(**kwargs):
+            events.append(("display_bind", kwargs["src"]))
+
+        @staticmethod
+        def init(display_type, to_ide=False):
+            events.append(("display_init", display_type))
+
+        @staticmethod
+        def width():
+            return 800
+
+        @staticmethod
+        def height():
+            return 480
+
+        @staticmethod
+        def deinit():
+            events.append(("display_deinit",))
+
+    class FakeMediaManager:
+        @staticmethod
+        def init():
+            events.append(("media_init", sensors[-1].enable_blob_channel))
+
+        @staticmethod
+        def deinit():
+            events.append(("media_deinit",))
+
+    class FakeImage:
+        ARGB8888 = "argb"
+
+        @staticmethod
+        def Image(width, height, pixel_format):
+            events.append(("osd", width, height, pixel_format))
+            return "osd"
+
+    class FakeRtspServer:
+        def __init__(self, width, height, port, session):
+            events.append(("rtsp", width, height, port, session))
+
+    configure_namespace = {
+        "DISPLAY_WIDTH": 800,
+        "DISPLAY_HEIGHT": 480,
+        "OUT_RGB888P_WIDTH": 640,
+        "OUT_RGB888P_HEIGH": 360,
+        "PIXEL_FORMAT_YUV_SEMIPLANAR_420": "yuv420",
+        "PIXEL_FORMAT_RGB_888_PLANAR": "rgbp888",
+        "CAM_CHN_ID_1": 1,
+        "CAM_CHN_ID_2": 2,
+        "Sensor": FakeSensorType,
+    }
+    configure_camera_sensor = load_pure_function(
+        "configure_camera_sensor", configure_namespace)
+
+    def create_camera_sensor(enable_blob_channel):
+        sensor = FakeSensor(enable_blob_channel)
+        return configure_camera_sensor(sensor, enable_blob_channel)
+
+    cleanup_camera_start = load_pure_function(
+        "cleanup_camera_start",
+        {"Display": FakeDisplay, "MediaManager": FakeMediaManager},
     )
-    media_init = next(
-        call
-        for call in ast.walk(detection)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "MediaManager"
-        and call.func.attr == "init"
+    start_camera_pipeline = load_pure_function(
+        "start_camera_pipeline",
+        {
+            "create_camera_sensor": create_camera_sensor,
+            "cleanup_camera_start": cleanup_camera_start,
+            "Display": FakeDisplay,
+            "MediaManager": FakeMediaManager,
+            "image": FakeImage,
+            "LowLatencyRtspH264Server": FakeRtspServer,
+            "display_mode": "lcd",
+            "DISPLAY_WIDTH": 800,
+            "DISPLAY_HEIGHT": 480,
+            "CAM_CHN_ID_0": 0,
+            "RTSP_PORT": 8554,
+            "RTSP_SESSION": "ball",
+        },
     )
-    blob_try = next(
-        (
-            node
-            for node in ast.walk(detection)
-            if isinstance(node, ast.Try)
-            and any(
-                isinstance(call.func, ast.Attribute)
-                and isinstance(call.func.value, ast.Name)
-                and call.func.value.id == "sensor"
-                and call.func.attr == "set_pixformat"
-                and call.args
-                and isinstance(call.args[0], ast.Attribute)
-                and isinstance(call.args[0].value, ast.Name)
-                and call.args[0].value.id == "Sensor"
-                and call.args[0].attr == "RGB565"
-                and any(
-                    keyword.arg == "chn"
-                    and isinstance(keyword.value, ast.Name)
-                    and keyword.value.id == "CAM_CHN_ID_1"
-                    for keyword in call.keywords
-                )
-                for call in ast.walk(node)
-                if isinstance(call, ast.Call)
-            )
+    start_camera_with_blob_fallback = load_pure_function(
+        "start_camera_with_blob_fallback", {"print": lambda *args: None})
+
+    sensor, osd_img, rtsp_server, blob_available = (
+        start_camera_with_blob_fallback(start_camera_pipeline))
+
+    assert sensor is sensors[1]
+    assert sensors[0] is not sensors[1]
+    assert sensors[0].channels == {0, 1, 2}
+    assert sensors[1].channels == {0, 2}
+    assert osd_img == "osd"
+    assert isinstance(rtsp_server, FakeRtspServer)
+    assert blob_available is False
+    assert events.index(("media_init", True)) < events.index(("sensor_run", True))
+    assert events.index(("sensor_stop", True, True)) < events.index(("reset", False))
+    assert events.index(("media_init", False)) < events.index(("sensor_run", False))
+
+
+def test_blob_setter_failure_releases_partial_sensor_before_fallback():
+    class FakeGc:
+        @staticmethod
+        def collect():
+            pass
+
+    class FakeTime:
+        @staticmethod
+        def sleep_ms(duration):
+            pass
+
+    class LegacySensor:
+        RGB565 = "rgb565"
+        active = False
+
+        def __init__(self, id, fps):
+            if LegacySensor.active:
+                raise RuntimeError("sensor already initialized")
+            LegacySensor.active = True
+
+        def reset(self):
+            pass
+
+        def set_hmirror(self, value):
+            pass
+
+        def set_vflip(self, value):
+            pass
+
+        def set_framesize(self, **kwargs):
+            pass
+
+        def set_pixformat(self, pixel_format, chn=0):
+            if chn == 1:
+                raise RuntimeError("channel 1 unsupported")
+
+        def stop(self, *args, **kwargs):
+            if kwargs:
+                raise TypeError("legacy stop has no is_del")
+            LegacySensor.active = False
+
+    constants = {
+        "DISPLAY_WIDTH": 800,
+        "DISPLAY_HEIGHT": 480,
+        "OUT_RGB888P_WIDTH": 640,
+        "OUT_RGB888P_HEIGH": 360,
+        "PIXEL_FORMAT_YUV_SEMIPLANAR_420": "yuv420",
+        "PIXEL_FORMAT_RGB_888_PLANAR": "rgbp888",
+        "CAM_CHN_ID_1": 1,
+        "CAM_CHN_ID_2": 2,
+        "CAMERA_PROBE_RETRIES": 1,
+        "CAMERA_CSI_ID": 2,
+        "Sensor": LegacySensor,
+        "gc": FakeGc,
+        "time": FakeTime,
+    }
+    configure_camera_sensor = load_pure_function(
+        "configure_camera_sensor", constants)
+    cleanup_camera_start = load_pure_function(
+        "cleanup_camera_start",
+        {"Display": None, "MediaManager": None},
+    )
+    create_camera_sensor = load_pure_function(
+        "create_camera_sensor",
+        dict(
+            constants,
+            configure_camera_sensor=configure_camera_sensor,
+            cleanup_camera_start=cleanup_camera_start,
         ),
-        None,
     )
-    assert blob_try is not None, "channel 1 RGB565 setup is missing"
-    calls = [call for call in ast.walk(blob_try) if isinstance(call, ast.Call)]
-    assert any(
-        isinstance(call.func, ast.Attribute)
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "sensor"
-        and call.func.attr == "set_framesize"
-        and any(
-            keyword.arg == "chn"
-            and isinstance(keyword.value, ast.Name)
-            and keyword.value.id == "CAM_CHN_ID_1"
-            for keyword in call.keywords
-        )
-        for call in calls
-    )
-    assert blob_try.lineno < media_init.lineno
-    assert any(
-        isinstance(value, ast.Constant)
-        and value.value == "Blob channel unavailable; KPU fallback active"
-        for handler in blob_try.handlers
-        for value in ast.walk(handler)
-    )
+    start_camera_with_blob_fallback = load_pure_function(
+        "start_camera_with_blob_fallback", {"print": lambda *args: None})
+
+    def start_attempt(enable_blob_channel):
+        return create_camera_sensor(enable_blob_channel), "osd", "rtsp"
+
+    sensor, _, _, blob_available = start_camera_with_blob_fallback(start_attempt)
+    assert isinstance(sensor, LegacySensor)
+    assert blob_available is False
 
 
 def test_three_sample_velocity_and_bounded_prediction():
@@ -310,6 +468,7 @@ if __name__ == "__main__":
     test_blob_candidate_prefers_nearest_valid_ball()
     test_blob_detection_returns_plain_candidate_from_requested_roi()
     test_blob_channel_is_best_effort_and_configured_before_media_init()
+    test_blob_setter_failure_releases_partial_sensor_before_fallback()
     test_three_sample_velocity_and_bounded_prediction()
     test_osd_updates_at_the_requested_cadence()
     test_control_ui_is_full_rate_and_rtc_is_removed()
