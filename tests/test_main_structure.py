@@ -17,7 +17,7 @@ PURE_CONSTANTS = {
         "BLOB_MAX_CENTER_DISTANCE",
         "TRACK_SEARCH", "TRACK_ACTIVE", "TRACK_RECOVER",
         "AI_VALIDATE_INTERVAL", "BLOB_LOST_TO_RECOVER",
-        "AI_FAILURES_TO_RECOVER",
+        "AI_FAILURES_TO_RECOVER", "AI_BLOB_IDENTITY_MAX_DISTANCE",
     }
 }
 
@@ -173,6 +173,35 @@ def test_kpu_reacquisition_clears_blob_misses_before_returning_to_track():
     assert state == "TRACK"
     assert (blob_misses, ai_failures, predicted_frames) == (0, 0, 0)
     assert transition("TRACK", False, False, 1, 0) == "TRACK"
+
+
+def test_kpu_capture_within_blob_identity_gate_is_valid():
+    identity_match = load_pure_function("kpu_blob_identity_match")
+    capture = {"cx": 130, "cy": 115}
+    assert identity_match(100, 100, capture) is True
+
+
+def test_distant_kpu_capture_fails_without_overwriting_blob_control():
+    identity_match = load_pure_function("kpu_blob_identity_match")
+    transition = load_pure_function("hybrid_transition")
+    validation_outcome = load_pure_function(
+        "kpu_validation_outcome",
+        {"kpu_blob_identity_match": identity_match},
+    )
+    published_control = {
+        "x": 116, "y": 101, "vx": 0.2, "vy": 0.0,
+        "valid": True, "source": "blob", "timestamp_ms": 50,
+    }
+    before = dict(published_control)
+
+    returned, valid, failures = validation_outcome(
+        published_control, 100, 100, {"cx": 300, "cy": 100}, 1)
+
+    assert returned is published_control
+    assert returned == before
+    assert valid is False
+    assert failures == 2
+    assert transition("TRACK", True, valid, 0, failures) == "RECOVER"
 
 
 def test_hybrid_schedule_is_control_first_with_six_frame_validation():
@@ -340,6 +369,71 @@ def test_validation_loop_commits_control_before_kpu_inference():
     ]
     assert publish_lines and kpu_lines
     assert min(publish_lines) < min(kpu_lines)
+
+
+def test_blob_detector_exception_releases_frame_and_falls_back_to_kpu():
+    events = []
+
+    class Frame:
+        def __del__(self):
+            events.append("release")
+
+    class Sensor:
+        def snapshot(self, **kwargs):
+            events.append(("snapshot", kwargs))
+            return Frame()
+
+    def failing_detector(*args):
+        events.append("detect")
+        raise RuntimeError("find_blobs failed")
+
+    snapshot_blob_channel = load_pure_function(
+        "snapshot_blob_channel",
+        {
+            "CAM_CHN_ID_1": 1,
+            "detect_blob_measurement": failing_detector,
+            "print": lambda *args: events.append("fallback"),
+        },
+    )
+    schedule = load_pure_function("hybrid_frame_actions")
+
+    capture, available = snapshot_blob_channel(
+        Sensor(), True, (4, 110, 192, 140), 100, 180)
+
+    assert capture is None
+    assert available is False
+    assert events == [
+        ("snapshot", {"chn": 1, "timeout": 2000}),
+        "detect",
+        "fallback",
+        "release",
+    ]
+    assert schedule("TRACK", 7, available) == ("kpu",)
+
+
+def test_blob_channel_does_not_swallow_keyboard_interrupt():
+    class Sensor:
+        def snapshot(self, **kwargs):
+            return object()
+
+    def interrupt_detector(*args):
+        raise KeyboardInterrupt()
+
+    snapshot_blob_channel = load_pure_function(
+        "snapshot_blob_channel",
+        {
+            "CAM_CHN_ID_1": 1,
+            "detect_blob_measurement": interrupt_detector,
+            "print": lambda *args: None,
+        },
+    )
+
+    try:
+        snapshot_blob_channel(
+            Sensor(), True, (4, 110, 192, 140), 100, 180)
+    except KeyboardInterrupt:
+        return
+    assert False, "KeyboardInterrupt was swallowed by Blob fallback"
 
 
 def test_blob_channel_is_best_effort_and_configured_before_media_init():
@@ -696,12 +790,16 @@ if __name__ == "__main__":
     test_blob_tracking_roi_stays_inside_the_global_rod_region()
     test_hybrid_tracking_transitions()
     test_kpu_reacquisition_clears_blob_misses_before_returning_to_track()
+    test_kpu_capture_within_blob_identity_gate_is_valid()
+    test_distant_kpu_capture_fails_without_overwriting_blob_control()
     test_hybrid_schedule_is_control_first_with_six_frame_validation()
     test_one_missed_blob_frame_is_predicted_then_requests_invalidation()
     test_tracking_marker_uses_state_color_and_skips_invalid_control()
     test_control_outputs_call_servo_hook_before_uart_osd_display()
     test_kpu_frame_resources_are_released_before_blob_only_frames()
     test_validation_loop_commits_control_before_kpu_inference()
+    test_blob_detector_exception_releases_frame_and_falls_back_to_kpu()
+    test_blob_channel_does_not_swallow_keyboard_interrupt()
     test_blob_channel_is_best_effort_and_configured_before_media_init()
     test_blob_setter_failure_releases_partial_sensor_before_fallback()
     test_three_sample_velocity_and_bounded_prediction()

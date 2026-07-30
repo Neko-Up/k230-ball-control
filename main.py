@@ -119,6 +119,7 @@ AI_VALIDATE_INTERVAL      = 6
 BLOB_LOST_TO_RECOVER      = 2
 AI_FAILURES_TO_RECOVER    = 2
 PREDICT_ONLY_MAX_FRAMES   = 1
+AI_BLOB_IDENTITY_MAX_DISTANCE = 80
 
 # ============================================================
 # 中值滤波
@@ -213,6 +214,24 @@ def ai_capture_counters(state, blob_valid, blob_misses):
     return blob_misses, 0, 0
 
 
+def kpu_blob_identity_match(blob_x, blob_y, capture):
+    if capture is None:
+        return False
+    delta_x = capture["cx"] - blob_x
+    delta_y = capture["cy"] - blob_y
+    return (delta_x * delta_x + delta_y * delta_y <=
+            AI_BLOB_IDENTITY_MAX_DISTANCE *
+            AI_BLOB_IDENTITY_MAX_DISTANCE)
+
+
+def kpu_validation_outcome(published_control, blob_x, blob_y,
+                           capture, ai_failures):
+    valid = kpu_blob_identity_match(blob_x, blob_y, capture)
+    if valid:
+        return published_control, True, 0
+    return published_control, False, ai_failures + 1
+
+
 def hybrid_frame_actions(state, frame_number, blob_available):
     if not blob_available:
         return ("kpu",)
@@ -304,6 +323,22 @@ def detect_blob_measurement(img, dynamic_roi,
     if expected_y is None:
         expected_y = dynamic_roi[1] + dynamic_roi[3] / 2
     return select_blob_candidate(candidates, expected_x, expected_y)
+
+
+def snapshot_blob_channel(sensor, should_detect, dynamic_roi,
+                          expected_x, expected_y):
+    blob_img = None
+    try:
+        blob_img = sensor.snapshot(chn=CAM_CHN_ID_1, timeout=2000)
+        if should_detect:
+            return (detect_blob_measurement(
+                blob_img, dynamic_roi, expected_x, expected_y), True)
+        return None, True
+    except Exception as e:
+        print("Blob channel unavailable; KPU fallback active:", e)
+        return None, False
+    finally:
+        del blob_img
 
 
 def blob_tracking_roi(expected_x):
@@ -1279,39 +1314,36 @@ def detection():
     try:
         while True:
             with ScopedTiming("total", debug_mode > 0):
-                blob_img = None
+                dynamic_roi = blob_tracking_roi(control_state["x"])
+                blob_capture = None
                 if blob_channel_available:
-                    try:
-                        blob_img = sensor.snapshot(
-                            chn=CAM_CHN_ID_1, timeout=2000)
-                    except BaseException as e:
-                        print("Blob channel unavailable; KPU fallback active:", e)
-                        blob_channel_available = False
+                    blob_capture, blob_channel_available = (
+                        snapshot_blob_channel(
+                            sensor, tracker_state == TRACK_ACTIVE,
+                            dynamic_roi,
+                            control_state["x"], control_state["y"]))
+                    if not blob_channel_available:
                         tracker_state = TRACK_SEARCH
                         blob_misses = 0
                         ai_failures = 0
                         predicted_frames = 0
+                        motion_samples = []
 
                 actions = hybrid_frame_actions(
                     tracker_state, frame_counter + 1,
                     blob_channel_available)
-                if actions == ("kpu",) and blob_img is not None:
-                    del blob_img
-                    blob_img = None
                 blob_valid = False
+                blob_measurement_x = None
+                blob_measurement_y = None
                 ai_valid = False
 
                 for action in actions:
                     if action == "blob_control":
-                        dynamic_roi = blob_tracking_roi(control_state["x"])
-                        blob_capture = detect_blob_measurement(
-                            blob_img, dynamic_roi,
-                            control_state["x"], control_state["y"])
-                        del blob_img
-                        blob_img = None
                         if blob_capture is not None:
                             blob_x = blob_capture["x"] + blob_capture["w"] // 2
                             blob_y = blob_capture["y"] + blob_capture["h"] // 2
+                            blob_measurement_x = blob_x
+                            blob_measurement_y = blob_y
                             publish_measurement(
                                 blob_x, blob_y, "blob", time.ticks_ms())
                             blob_valid = True
@@ -1399,15 +1431,25 @@ def detection():
                         blob_channel_available and
                         tracker_state == TRACK_ACTIVE)
                     if validation_only:
-                        if ai_valid:
+                        if blob_valid:
+                            control_state, ai_valid, ai_failures = (
+                                kpu_validation_outcome(
+                                    control_state,
+                                    blob_measurement_x, blob_measurement_y,
+                                    capture, ai_failures))
+                            if ai_valid:
+                                blob_misses, _, predicted_frames = (
+                                    ai_capture_counters(
+                                        tracker_state, blob_valid,
+                                        blob_misses))
+                        elif ai_valid:
                             blob_misses, ai_failures, predicted_frames = (
                                 ai_capture_counters(
                                     tracker_state, blob_valid, blob_misses))
-                            if not blob_valid:
-                                motion_samples = []
-                                publish_measurement(
-                                    capture["cx"], capture["cy"],
-                                    "kpu", time.ticks_ms())
+                            motion_samples = []
+                            publish_measurement(
+                                capture["cx"], capture["cy"],
+                                "kpu", time.ticks_ms())
                         else:
                             ai_failures += 1
                     else:
@@ -1459,8 +1501,6 @@ def detection():
                     ai_failures = 0
                     predicted_frames = 0
 
-                if blob_img is not None:
-                    del blob_img
                 gc_frame_count += 1
                 if gc_frame_count >= GC_EVERY_N_FRAMES:
                     gc.collect()
