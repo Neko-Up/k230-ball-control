@@ -74,4 +74,4 @@
 - [x] Run `python -m py_compile main_two_touch_calibration.py` and confirm syntax success.
 - [x] Run `git diff --check` and inspect the complete diff for unrelated changes.
 - [x] Update this plan's checkboxes, commit only tracked implementation/test/plan files, and leave `main_green_pipe_tracking.py` untouched.
-- [ ] Push branch `agent/h264-circle-stream` and report the exact wiring, DIP settings, startup procedure, and hardware-only validation still required.
+- [x] Push branch `agent/h264-circle-stream` and report the exact wiring, DIP settings, startup procedure, and hardware-only validation still required.
