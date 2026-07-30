@@ -12,8 +12,8 @@ import gc
 import time
 import uctypes
 import network
-import socket
 import _thread
+import multimedia as mm
 
 import aicube
 import image
@@ -55,7 +55,7 @@ config_path = "/sdcard/mp_deployment_source/deploy_config.json"
 debug_mode  = 0
 
 # ============================================================
-# Wi-Fi（仅联网，不启用视频推流）
+# Wi-Fi + VLC H.264/RTSP 图传
 # ============================================================
 WIFI_MODE         = "ap"       # "ap": K230 开热点；"sta": 连接现有 Wi-Fi
 WIFI_AP_SSID      = "K230_BALL"
@@ -65,8 +65,11 @@ WIFI_STA_SSID     = "YOUR_WIFI"
 WIFI_STA_PASSWORD = "YOUR_PASSWORD"
 WIFI_CONNECT_MS   = 15000
 
-MJPEG_PORT        = 8080
-MJPEG_QUALITY     = 60
+RTSP_PORT         = 8554
+RTSP_SESSION      = "ball"
+H264_BITRATE      = 1000       # Kbit/s
+H264_FPS          = 15
+H264_GOP          = 15
 
 def format_iso_time(epoch_s=None, millis=0):
     """OSD 使用的 ISO 8601 本地时间（UTC+08:00）。"""
@@ -286,8 +289,9 @@ def smooth_box(old_box, new_box):
 def scan_best_channel():
     """
     启动时选择一次最佳2.4G信道。
-    不运行中切换，避免MJPEG断流。
+    不运行中切换，避免 RTSP 断流。
     """
+    sta = None
     try:
         sta = network.WLAN(network.STA_IF)
         sta.active(True)
@@ -307,6 +311,19 @@ def scan_best_channel():
     except BaseException as e:
         print("Wi-Fi scan failed:", e)
         return 6
+    finally:
+        if sta is not None:
+            try:
+                sta.active(False)
+            except BaseException:
+                pass
+
+
+def select_default_network_device(device_name):
+    if hasattr(network, "set_default_dev"):
+        if network.set_default_dev(device_name) is False:
+            raise RuntimeError(
+                "Failed to select network device {}".format(device_name))
 
 def start_wifi():
     if WIFI_MODE == "ap":
@@ -325,6 +342,7 @@ def start_wifi():
                 wlan.config(ssid=WIFI_AP_SSID,
                             password=WIFI_AP_PASSWORD)
         time.sleep_ms(500)
+        select_default_network_device("w1")
         print("Wi-Fi AP:", WIFI_AP_SSID, "password:", WIFI_AP_PASSWORD)
         print("Wi-Fi IP:", wlan.ifconfig()[0])
         return wlan
@@ -339,184 +357,199 @@ def start_wifi():
             if time.ticks_diff(time.ticks_ms(), start_ms) >= WIFI_CONNECT_MS:
                 raise RuntimeError("Wi-Fi connect timeout")
             time.sleep_ms(200)
+    select_default_network_device("w0")
     print("Wi-Fi connected, IP:", wlan.ifconfig()[0])
     return wlan
 
 
 # ============================================================
-# MJPEG（WBC + 硬件 JPEG）
+# VLC H.264/RTSP（WBC 合成画面 + 硬件编码）
 # ============================================================
 
-class LowLatencyMjpegServer:
-    def __init__(self, width, height, port=MJPEG_PORT):
+class LowLatencyRtspH264Server:
+    def __init__(self, width, height, port=RTSP_PORT,
+                 session_name=RTSP_SESSION):
         self.width = ALIGN_UP(width, 16)
         self.height = height
         self.port = port
+        self.session_name = session_name
         self.encoder = Encoder()
         self.venc_chn = VENC_CHN_ID_0
         self.channel_api = True
+        self.rtsp = mm.rtsp_server()
         self.running = False
         self.thread_over = True
-        self.server_sock = None
-        self.client_sock = None
+        self.encoder_created = False
+        self.encoder_started = False
+        self.rtsp_initialized = False
 
         # 编码缓冲必须在 MediaManager.init() 前配置。
         try:
             self.encoder.SetOutBufs(
-                self.venc_chn, 4, self.width, self.height)
+                self.venc_chn, 16, self.width, self.height)
         except TypeError:
             self.channel_api = False
-            self.encoder.SetOutBufs(4, self.width, self.height)
+            self.encoder.SetOutBufs(16, self.width, self.height)
 
-    def start(self):
-        encoder_created = False
-        encoder_started = False
-        wbc_started = False
-        try:
-            attr = ChnAttrStr(
-                self.encoder.PAYLOAD_TYPE_JPEG, 0,
-                self.width, self.height,
-                4000, 15, 15, 15, MJPEG_QUALITY)
-            if self.channel_api:
-                self.encoder.Create(self.venc_chn, attr)
-                encoder_created = True
-                self.encoder.Start(self.venc_chn)
-            else:
-                self.encoder.Create(attr)
-                encoder_created = True
-                self.venc_chn = self.encoder.chn
-                self.encoder.Start()
-            encoder_started = True
-
-            if not WBCDisplay.writeback(True):
-                raise RuntimeError("start WBC for MJPEG failed")
-            wbc_started = True
-
-            addr = socket.getaddrinfo("0.0.0.0", self.port)[0][-1]
-            self.server_sock = socket.socket()
-            self.server_sock.setsockopt(
-                socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_sock.bind(addr)
-            self.server_sock.listen(1)
-            self.server_sock.settimeout(0.2)
-
-            self.running = True
-            self.thread_over = False
-            _thread.start_new_thread(self._serve, ())
-            print("MJPEG quality:", MJPEG_QUALITY)
-        except BaseException:
-            self.running = False
-            if self.server_sock:
-                try:
-                    self.server_sock.close()
-                except BaseException:
-                    pass
-                self.server_sock = None
-            if wbc_started:
-                WBCDisplay.writeback(False)
-            if encoder_started:
-                try:
-                    if self.channel_api:
-                        self.encoder.Stop(self.venc_chn)
-                    else:
-                        self.encoder.Stop()
-                except BaseException:
-                    pass
-            if encoder_created:
-                try:
-                    if self.channel_api:
-                        self.encoder.Destroy(self.venc_chn)
-                    else:
-                        self.encoder.Destroy()
-                except BaseException:
-                    pass
-            raise
-
-    def _encode_jpeg(self, frame_info):
-        stream = StreamData()
+    def _encoder_create(self):
+        attr = ChnAttrStr(
+            self.encoder.PAYLOAD_TYPE_H264,
+            self.encoder.H264_PROFILE_MAIN,
+            self.width, self.height,
+            bit_rate=H264_BITRATE, gopLen=H264_GOP)
         if self.channel_api:
-            ret = self.encoder.SendFrame(self.venc_chn, frame_info, 100)
+            self.encoder.Create(self.venc_chn, attr)
         else:
-            ret = self.encoder.SendFrame(frame_info, 100)
-        if ret != 0:
-            return None
+            self.encoder.Create(attr)
+            self.venc_chn = self.encoder.chn
+        self.encoder_created = True
 
+    def _encoder_start(self):
         if self.channel_api:
-            ret = self.encoder.GetStream(self.venc_chn, stream, 100)
+            self.encoder.Start(self.venc_chn)
         else:
-            ret = self.encoder.GetStream(stream, 100)
-        if ret != 0:
-            return None
+            self.encoder.Start()
+        self.encoder_started = True
 
-        parts = []
-        for i in range(stream.pack_cnt):
-            parts.append(bytes(uctypes.bytearray_at(
-                stream.data[i], stream.data_size[i])))
+    def _encoder_send_frame(self, frame_info):
+        if self.channel_api:
+            return self.encoder.SendFrame(self.venc_chn, frame_info, 100)
+        return self.encoder.SendFrame(frame_info, 100)
+
+    def _encoder_get_stream(self, stream):
+        if self.channel_api:
+            return self.encoder.GetStream(self.venc_chn, stream, 100)
+        return self.encoder.GetStream(stream, 100)
+
+    def _encoder_release_stream(self, stream):
         if self.channel_api:
             self.encoder.ReleaseStream(self.venc_chn, stream)
         else:
             self.encoder.ReleaseStream(stream)
-        return b"".join(parts)
 
-    def _serve(self):
-        header = (b"HTTP/1.1 200 OK\r\n"
-                  b"Cache-Control: no-store, no-cache\r\n"
-                  b"Connection: close\r\n"
-                  b"Content-Type: multipart/x-mixed-replace; "
-                  b"boundary=frame\r\n\r\n")
-        while self.running:
+    def _send_pack(self, stream, pack_idx):
+        send_phy = getattr(
+            self.rtsp, "rtspserver_sendvideodata_byphyaddr", None)
+        if send_phy is not None and hasattr(stream, "phy_addr"):
+            return send_phy(
+                self.session_name, stream.phy_addr[pack_idx],
+                stream.data_size[pack_idx], 1000)
+
+        # 兼容未暴露物理地址发送接口的旧固件。
+        payload = bytes(uctypes.bytearray_at(
+            stream.data[pack_idx], stream.data_size[pack_idx]))
+        return self.rtsp.rtspserver_sendvideodata(
+            self.session_name, payload, len(payload), 1000)
+
+    def _stream_loop(self):
+        frame_interval_ms = max(1, 1000 // H264_FPS)
+        next_frame_ms = time.ticks_ms()
+        try:
+            while self.running:
+                now_ms = time.ticks_ms()
+                wait_ms = time.ticks_diff(next_frame_ms, now_ms)
+                if wait_ms > 0:
+                    time.sleep_ms(wait_ms)
+                next_frame_ms = time.ticks_add(
+                    next_frame_ms, frame_interval_ms)
+
+                frame_info = WBCDisplay.writeback_dump(100)
+                if not frame_info:
+                    continue
+                if self._encoder_send_frame(frame_info) != 0:
+                    continue
+
+                stream = StreamData()
+                if self._encoder_get_stream(stream) != 0:
+                    continue
+                try:
+                    for pack_idx in range(stream.pack_cnt):
+                        self._send_pack(stream, pack_idx)
+                finally:
+                    self._encoder_release_stream(stream)
+        except BaseException as e:
+            if self.running:
+                print("RTSP stream thread stopped:", e)
+        self.thread_over = True
+
+    def get_url(self, host=None):
+        if host:
+            return "rtsp://{}:{}/{}".format(
+                host, self.port, self.session_name)
+        return self.rtsp.rtspserver_getrtspurl(self.session_name)
+
+    def start(self, host=None):
+        if self.running:
+            return
+        wbc_started = False
+        try:
+            self._encoder_create()
+            if self.rtsp.rtspserver_init(self.port) != 0:
+                raise RuntimeError("RTSP failed to bind port {}".format(
+                    self.port))
+            self.rtsp_initialized = True
+            if self.rtsp.rtspserver_createsession(
+                    self.session_name,
+                    mm.multi_media_type.media_h264, False) != 0:
+                raise RuntimeError("RTSP session creation failed")
+            self.rtsp.rtspserver_start()
+            self._encoder_start()
+            if not WBCDisplay.writeback(True):
+                raise RuntimeError("start WBC for RTSP failed")
+            wbc_started = True
+
+            self.running = True
+            self.thread_over = False
+            _thread.start_new_thread(self._stream_loop, ())
+            print("H264 RTSP for VLC:", self.get_url(host))
+        except BaseException:
+            self.running = False
+            if wbc_started:
+                WBCDisplay.writeback(False)
+            self._release_resources()
+            raise
+
+    def _release_resources(self):
+        if self.encoder_started:
             try:
-                client, _ = self.server_sock.accept()
-            except OSError:
-                continue
-            self.client_sock = client
-            try:
-                client.sendall(header)
-                while self.running:
-                    frame_info = WBCDisplay.writeback_dump(100)
-                    if not frame_info:
-                        continue
-                    jpg = self._encode_jpeg(frame_info)
-                    if not jpg:
-                        continue
-                    client.sendall(
-                        b"--frame\r\nContent-Type: image/jpeg\r\n" +
-                        b"Content-Length: " + str(len(jpg)).encode() +
-                        b"\r\n\r\n")
-                    client.sendall(jpg)
-                    client.sendall(b"\r\n")
-            except OSError:
-                pass
-            try:
-                client.close()
+                if self.channel_api:
+                    self.encoder.Stop(self.venc_chn)
+                else:
+                    self.encoder.Stop()
             except BaseException:
                 pass
-            self.client_sock = None
-        self.thread_over = True
+            self.encoder_started = False
+        if self.encoder_created:
+            try:
+                if self.channel_api:
+                    self.encoder.Destroy(self.venc_chn)
+                else:
+                    self.encoder.Destroy()
+            except BaseException:
+                pass
+            self.encoder_created = False
+        if self.rtsp_initialized:
+            try:
+                self.rtsp.rtspserver_stop()
+            except BaseException:
+                pass
+            try:
+                self.rtsp.rtspserver_deinit()
+            except BaseException:
+                pass
+            self.rtsp_initialized = False
 
     def stop(self):
         self.running = False
-        if self.client_sock:
-            try:
-                self.client_sock.close()
-            except BaseException:
-                pass
-        if self.server_sock:
-            try:
-                self.server_sock.close()
-            except BaseException:
-                pass
         start_ms = time.ticks_ms()
         while (not self.thread_over and
-               time.ticks_diff(time.ticks_ms(), start_ms) < 1000):
+               time.ticks_diff(time.ticks_ms(), start_ms) < 1500):
             time.sleep_ms(20)
-        WBCDisplay.writeback(False)
-        if self.channel_api:
-            self.encoder.Stop(self.venc_chn)
-            self.encoder.Destroy(self.venc_chn)
-        else:
-            self.encoder.Stop()
-            self.encoder.Destroy()
+        try:
+            WBCDisplay.writeback(False)
+        except BaseException:
+            pass
+        self._release_resources()
 
 
 # ============================================================
@@ -955,8 +988,8 @@ def detection():
     else:
         Display.init(Display.LT9611, to_ide=False)
     osd_img = image.Image(DISPLAY_WIDTH, DISPLAY_HEIGHT, image.ARGB8888)
-    mjpeg_server = LowLatencyMjpegServer(
-        Display.width(), Display.height(), MJPEG_PORT)
+    rtsp_server = LowLatencyRtspH264Server(
+        Display.width(), Display.height(), RTSP_PORT, RTSP_SESSION)
     MediaManager.init()
     sensor.run()
 
@@ -985,11 +1018,9 @@ def detection():
                         print("Wi-Fi disabled after initialization failure:", e)
                     if wlan is not None:
                         try:
-                            mjpeg_server.start()
-                            print("MJPEG (with OSD): http://{}:{}/".format(
-                                wlan.ifconfig()[0], MJPEG_PORT))
+                            rtsp_server.start(wlan.ifconfig()[0])
                         except BaseException as e:
-                            print("MJPEG disabled after initialization failure:", e)
+                            print("RTSP disabled after initialization failure:", e)
                 if rgb888p_img.format() == image.RGBP888:
                     ai2d_input = rgb888p_img.to_numpy_ref()
                     ai2d_input_tensor = nn.from_numpy(ai2d_input)
@@ -1048,8 +1079,8 @@ def detection():
         print("=== Runtime error ===", e)
         raise
 
-    if mjpeg_server.running:
-        mjpeg_server.stop()
+    if rtsp_server.running:
+        rtsp_server.stop()
     sensor.stop()
     Display.deinit()
     MediaManager.deinit()

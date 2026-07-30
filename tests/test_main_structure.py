@@ -59,8 +59,31 @@ def test_uart_updates_are_not_gated_by_osd_rendering():
         )
 
 
+def test_h264_rtsp_replaces_mjpeg_transport():
+    class_names = {
+        item.name for item in TREE.body if isinstance(item, ast.ClassDef)
+    }
+    assert "LowLatencyRtspH264Server" in class_names
+    assert "LowLatencyMjpegServer" not in class_names
+
+    assignments = {
+        target.id: ast.literal_eval(item.value)
+        for item in TREE.body
+        if isinstance(item, ast.Assign)
+        for target in item.targets
+        if isinstance(target, ast.Name)
+        and target.id in {"RTSP_PORT", "RTSP_SESSION", "H264_FPS"}
+    }
+    assert assignments == {
+        "RTSP_PORT": 8554,
+        "RTSP_SESSION": "ball",
+        "H264_FPS": 15,
+    }
+
+
 if __name__ == "__main__":
     test_detection_circle_geometry()
     test_osd_updates_every_second_ai_frame()
     test_uart_updates_are_not_gated_by_osd_rendering()
+    test_h264_rtsp_replaces_mjpeg_transport()
     print("tests: OK")
