@@ -12,9 +12,12 @@ PURE_CONSTANTS = {
     if isinstance(target, ast.Name)
     and target.id in {
         "MIN_BOX_SIZE", "MAX_BOX_SIZE", "MAX_ASPECT_RATIO",
-        "BLOB_THRESHOLDS",
+        "BLOB_THRESHOLDS", "BLOB_GLOBAL_ROI", "BLOB_ROI_HALF_WIDTH",
         "BLOB_MIN_PIXELS", "BLOB_MAX_PIXELS", "BLOB_MAX_ASPECT_RATIO",
         "BLOB_MAX_CENTER_DISTANCE",
+        "TRACK_SEARCH", "TRACK_ACTIVE", "TRACK_RECOVER",
+        "AI_VALIDATE_INTERVAL", "BLOB_LOST_TO_RECOVER",
+        "AI_FAILURES_TO_RECOVER",
     }
 }
 
@@ -115,6 +118,228 @@ def test_blob_detection_returns_plain_candidate_from_requested_roi():
             "merge": False,
         },
     )
+
+
+def test_blob_detection_uses_predicted_center_when_roi_is_edge_clamped():
+    select_blob_candidate = load_pure_function("select_blob_candidate")
+    detect_blob_measurement = load_pure_function(
+        "detect_blob_measurement",
+        {"select_blob_candidate": select_blob_candidate},
+    )
+
+    class Blob:
+        def rect(self):
+            return (620, 180, 20, 18)
+
+        def pixels(self):
+            return 240
+
+    class Image:
+        def find_blobs(self, thresholds, **kwargs):
+            return [Blob()]
+
+    result = detect_blob_measurement(
+        Image(), (448, 110, 192, 140), 639, 190)
+    assert result["x"] == 620
+
+
+def test_blob_tracking_roi_stays_inside_the_global_rod_region():
+    blob_tracking_roi = load_pure_function("blob_tracking_roi")
+    assert blob_tracking_roi(100) == (4, 110, 192, 140)
+    assert blob_tracking_roi(0) == (0, 110, 192, 140)
+    assert blob_tracking_roi(639) == (448, 110, 192, 140)
+
+
+def test_hybrid_tracking_transitions():
+    transition = load_pure_function("hybrid_transition")
+    assert transition("SEARCH", False, True, 0, 0) == "TRACK"
+    assert transition("TRACK", False, False, 1, 0) == "TRACK"
+    assert transition("TRACK", False, False, 2, 0) == "RECOVER"
+    assert transition("TRACK", True, False, 0, 2) == "RECOVER"
+    assert transition("RECOVER", False, True, 0, 0) == "TRACK"
+
+
+def test_kpu_reacquisition_clears_blob_misses_before_returning_to_track():
+    transition = load_pure_function("hybrid_transition")
+    ai_capture_counters = load_pure_function("ai_capture_counters")
+
+    state = transition("TRACK", False, False, 2, 0)
+    assert state == "RECOVER"
+    blob_misses, ai_failures, predicted_frames = ai_capture_counters(
+        state, False, 2)
+    state = transition(
+        state, False, True, blob_misses, ai_failures)
+
+    assert state == "TRACK"
+    assert (blob_misses, ai_failures, predicted_frames) == (0, 0, 0)
+    assert transition("TRACK", False, False, 1, 0) == "TRACK"
+
+
+def test_hybrid_schedule_is_control_first_with_six_frame_validation():
+    schedule = load_pure_function("hybrid_frame_actions")
+    assert PURE_CONSTANTS["AI_VALIDATE_INTERVAL"] == 6
+    assert schedule("TRACK", 2, True) == ("blob_control",)
+    assert schedule("TRACK", 3, True) == ("blob_control",)
+    assert schedule("TRACK", 5, True) == ("blob_control",)
+    assert schedule("TRACK", 6, True) == ("blob_control", "kpu")
+    assert schedule("TRACK", 12, True) == ("blob_control", "kpu")
+    assert schedule("SEARCH", 5, True) == ("kpu",)
+    assert schedule("RECOVER", 5, True) == ("kpu",)
+    assert schedule("TRACK", 5, False) == ("kpu",)
+
+
+def test_one_missed_blob_frame_is_predicted_then_requests_invalidation():
+    predict_position = load_pure_function("predict_position")
+    predict_miss = load_pure_function(
+        "prediction_for_missed_frame",
+        {
+            "predict_position": predict_position,
+            "PREDICTION_HORIZON_MS": 35,
+            "PREDICTION_MAX_SHIFT_PX": 16,
+            "PREDICT_ONLY_MAX_FRAMES": 1,
+        },
+    )
+    control = {
+        "x": 100, "y": 50, "vx": 0.2, "vy": 0.1,
+        "valid": True, "source": "blob", "timestamp_ms": 0,
+    }
+
+    predicted, predicted_frames = predict_miss(control, 0, 40)
+    assert predicted == {
+        "x": 107, "y": 54, "vx": 0.2, "vy": 0.1,
+        "valid": True, "source": "predict", "timestamp_ms": 40,
+    }
+    assert predicted_frames == 1
+    assert predict_miss(predicted, predicted_frames, 80) == (None, 1)
+
+
+def test_tracking_marker_uses_state_color_and_skips_invalid_control():
+    tracking_osd_color = load_pure_function("tracking_osd_color")
+    draw_tracking_marker = load_pure_function(
+        "draw_tracking_marker",
+        {
+            "tracking_osd_color": tracking_osd_color,
+            "ai_to_disp": lambda x, y: (x, y),
+        },
+    )
+
+    class Image:
+        def __init__(self):
+            self.circles = []
+
+        def draw_circle(self, x, y, radius, **kwargs):
+            self.circles.append((x, y, radius, kwargs))
+
+    img = Image()
+    valid = {"x": 120, "y": 80, "valid": True}
+    draw_tracking_marker(img, valid, "SEARCH")
+    draw_tracking_marker(img, valid, "TRACK")
+    draw_tracking_marker(img, valid, "RECOVER")
+    draw_tracking_marker(img, {"x": 0, "y": 0, "valid": False}, "TRACK")
+
+    assert [circle[3]["color"] for circle in img.circles] == [
+        (0, 255, 255, 255),
+        (0, 255, 0, 255),
+        (0, 0, 255, 255),
+    ]
+    assert all(circle[:3] == (120, 80, 12) for circle in img.circles)
+
+
+def test_control_outputs_call_servo_hook_before_uart_osd_display():
+    events = []
+
+    class OSD:
+        def clear(self):
+            events.append("clear")
+
+    class Display:
+        LAYER_OSD3 = 3
+
+        @staticmethod
+        def show_image(*args):
+            events.append("display")
+
+    shared_state = {"valid": True, "x": 10, "y": 20}
+    publish_outputs = load_pure_function(
+        "publish_control_outputs",
+        {
+            "frame_counter": 5,
+            "OSD_EVERY_N_FRAMES": 1,
+            "control_state": shared_state,
+            "should_render_osd": lambda frame, cadence: True,
+            "update_servo_control": lambda state: events.append(
+                ("servo", state)),
+            "draw_osd": lambda *args: events.append("uart_osd"),
+            "Display": Display,
+        },
+    )
+
+    publish_outputs(OSD(), None, [], object())
+    assert events == [
+        "clear",
+        ("servo", shared_state),
+        "uart_osd",
+        "display",
+    ]
+
+
+def test_kpu_frame_resources_are_released_before_blob_only_frames():
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    required = {
+        "rgb888p_img", "ai2d_input", "ai2d_input_tensor", "results",
+    }
+    released_together = False
+    for node in ast.walk(detection):
+        if not isinstance(node, ast.Try) or not node.finalbody:
+            continue
+        released = {
+            target.id
+            for statement in node.finalbody
+            if isinstance(statement, ast.Delete)
+            for target in statement.targets
+            if isinstance(target, ast.Name)
+        }
+        if required <= released:
+            released_together = True
+            break
+    assert released_together
+
+
+def test_validation_loop_commits_control_before_kpu_inference():
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    action_loop = next(
+        node
+        for node in ast.walk(detection)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Name)
+        and node.iter.id == "actions"
+    )
+    publish_lines = [
+        call.lineno
+        for call in ast.walk(action_loop)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "publish_control_outputs"
+    ]
+    kpu_lines = [
+        call.lineno
+        for call in ast.walk(action_loop)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "kpu"
+        and call.func.attr == "run"
+    ]
+    assert publish_lines and kpu_lines
+    assert min(publish_lines) < min(kpu_lines)
 
 
 def test_blob_channel_is_best_effort_and_configured_before_media_init():
@@ -467,6 +692,16 @@ if __name__ == "__main__":
     test_single_ai_capture_rejects_invalid_configured_boxes()
     test_blob_candidate_prefers_nearest_valid_ball()
     test_blob_detection_returns_plain_candidate_from_requested_roi()
+    test_blob_detection_uses_predicted_center_when_roi_is_edge_clamped()
+    test_blob_tracking_roi_stays_inside_the_global_rod_region()
+    test_hybrid_tracking_transitions()
+    test_kpu_reacquisition_clears_blob_misses_before_returning_to_track()
+    test_hybrid_schedule_is_control_first_with_six_frame_validation()
+    test_one_missed_blob_frame_is_predicted_then_requests_invalidation()
+    test_tracking_marker_uses_state_color_and_skips_invalid_control()
+    test_control_outputs_call_servo_hook_before_uart_osd_display()
+    test_kpu_frame_resources_are_released_before_blob_only_frames()
+    test_validation_loop_commits_control_before_kpu_inference()
     test_blob_channel_is_best_effort_and_configured_before_media_init()
     test_blob_setter_failure_releases_partial_sensor_before_fallback()
     test_three_sample_velocity_and_bounded_prediction()

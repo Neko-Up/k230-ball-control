@@ -112,6 +112,13 @@ BLOB_MIN_PIXELS           = 40
 BLOB_MAX_PIXELS           = 1600
 BLOB_MAX_ASPECT_RATIO     = 1.8
 BLOB_MAX_CENTER_DISTANCE  = 80
+TRACK_SEARCH              = "SEARCH"
+TRACK_ACTIVE              = "TRACK"
+TRACK_RECOVER             = "RECOVER"
+AI_VALIDATE_INTERVAL      = 6
+BLOB_LOST_TO_RECOVER      = 2
+AI_FAILURES_TO_RECOVER    = 2
+PREDICT_ONLY_MAX_FRAMES   = 1
 
 # ============================================================
 # 中值滤波
@@ -148,6 +155,7 @@ last_valid_cy     = -1
 
 tracks            = []
 frame_counter     = 0
+tracker_state     = TRACK_SEARCH
 current_deviation = {"dx": 0, "dy": 0, "valid": False, "dist_mm": 0.0}
 control_state = {
     "x": 0, "y": 0, "vx": 0.0, "vy": 0.0,
@@ -185,6 +193,49 @@ def predict_position(x, y, vx, vy, horizon_ms, max_shift_px):
     shift_x = max(-max_shift_px, min(max_shift_px, shift_x))
     shift_y = max(-max_shift_px, min(max_shift_px, shift_y))
     return int(round(x + shift_x)), int(round(y + shift_y)), clamped
+
+
+def hybrid_transition(state, blob_valid, ai_valid,
+                      blob_misses, ai_failures):
+    if state == TRACK_SEARCH or state == TRACK_RECOVER:
+        if ai_valid:
+            return TRACK_ACTIVE
+        return state
+    if (blob_misses >= BLOB_LOST_TO_RECOVER or
+            ai_failures >= AI_FAILURES_TO_RECOVER):
+        return TRACK_RECOVER
+    return TRACK_ACTIVE
+
+
+def ai_capture_counters(state, blob_valid, blob_misses):
+    if state != TRACK_ACTIVE or not blob_valid:
+        blob_misses = 0
+    return blob_misses, 0, 0
+
+
+def hybrid_frame_actions(state, frame_number, blob_available):
+    if not blob_available:
+        return ("kpu",)
+    if state != TRACK_ACTIVE:
+        return ("kpu",)
+    if frame_number % AI_VALIDATE_INTERVAL == 0:
+        return ("blob_control", "kpu")
+    return ("blob_control",)
+
+
+def prediction_for_missed_frame(current_state, predicted_frames, now_ms):
+    if (not current_state["valid"] or
+            predicted_frames >= PREDICT_ONLY_MAX_FRAMES):
+        return None, predicted_frames
+    pred_x, pred_y, _ = predict_position(
+        current_state["x"], current_state["y"],
+        current_state["vx"], current_state["vy"],
+        PREDICTION_HORIZON_MS, PREDICTION_MAX_SHIFT_PX)
+    return ({
+        "x": pred_x, "y": pred_y,
+        "vx": current_state["vx"], "vy": current_state["vy"],
+        "valid": True, "source": "predict", "timestamp_ms": now_ms,
+    }, predicted_frames + 1)
 
 
 def publish_measurement(x, y, source, now_ms):
@@ -233,7 +284,8 @@ def select_blob_candidate(candidates, expected_x, expected_y):
     return best_candidate
 
 
-def detect_blob_measurement(img, dynamic_roi):
+def detect_blob_measurement(img, dynamic_roi,
+                            expected_x=None, expected_y=None):
     blobs = img.find_blobs(
         BLOB_THRESHOLDS,
         roi=dynamic_roi,
@@ -247,9 +299,19 @@ def detect_blob_measurement(img, dynamic_roi):
             "x": x, "y": y, "w": width, "h": height,
             "pixels": blob.pixels(),
         })
-    expected_x = dynamic_roi[0] + dynamic_roi[2] / 2
-    expected_y = dynamic_roi[1] + dynamic_roi[3] / 2
+    if expected_x is None:
+        expected_x = dynamic_roi[0] + dynamic_roi[2] / 2
+    if expected_y is None:
+        expected_y = dynamic_roi[1] + dynamic_roi[3] / 2
     return select_blob_candidate(candidates, expected_x, expected_y)
+
+
+def blob_tracking_roi(expected_x):
+    global_x, global_y, global_width, global_height = BLOB_GLOBAL_ROI
+    roi_width = min(global_width, BLOB_ROI_HALF_WIDTH * 2)
+    roi_x = int(expected_x) - BLOB_ROI_HALF_WIDTH
+    roi_x = max(global_x, min(global_x + global_width - roi_width, roi_x))
+    return roi_x, global_y, roi_width, global_height
 
 
 def configure_camera_sensor(sensor, enable_blob_channel):
@@ -916,8 +978,42 @@ def should_render_osd(frame_number, cadence=2):
     return frame_number % cadence == 0
 
 
+def tracking_osd_color(tracking_state):
+    if tracking_state == TRACK_ACTIVE:
+        return (0, 255, 0, 255)
+    if tracking_state == TRACK_RECOVER:
+        return (0, 0, 255, 255)
+    return (0, 255, 255, 255)
+
+
+def draw_tracking_marker(osd_img, current_control, tracking_state):
+    if not current_control["valid"]:
+        return
+    marker_x, marker_y = ai_to_disp(
+        current_control["x"], current_control["y"])
+    osd_img.draw_circle(
+        marker_x, marker_y, 12,
+        color=tracking_osd_color(tracking_state), thickness=3)
+
+
+def update_servo_control(current_control):
+    # Hardware-specific servo configuration is intentionally left external.
+    return None
+
+
+def publish_control_outputs(osd_img, capture, color_four, uart_obj):
+    render_osd = should_render_osd(
+        frame_counter + 1, OSD_EVERY_N_FRAMES)
+    if render_osd:
+        osd_img.clear()
+    update_servo_control(control_state)
+    draw_osd(osd_img, capture, color_four, uart_obj, render_osd)
+    if render_osd:
+        Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
+
+
 def draw_osd(osd_img, capture, color_four, uart_obj, render_osd=True):
-    global frame_counter, state
+    global frame_counter, state, tracker_state
     global pos_hist_full
     global calib_stable_count, calib_last_cx, calib_last_cy
     global calib_cx, calib_cy, calib_done_flash, current_deviation
@@ -934,26 +1030,11 @@ def draw_osd(osd_img, capture, color_four, uart_obj, render_osd=True):
 
     gc_dx, gc_dy = ai_to_disp(GEOM_CENTER_X, GEOM_CENTER_Y)
 
-    # ---- 绘制当前 KPU 捕获 ----
-    count = 0
-    best_score = 0.0
-    if capture is not None:
-        x1, y1, x2, y2 = capture["box"]
-        bx, by = ai_to_disp(x1, y1)
-        bw     = int((x2 - x1) * DISPLAY_WIDTH  // OUT_RGB888P_WIDTH)
-        bh     = int((y2 - y1) * DISPLAY_HEIGHT // OUT_RGB888P_HEIGH)
-        if bw > 0 and bh > 0:
-            col = color_four[MERGED_CLASS_ID][1:]
-            circle_x, circle_y, circle_radius = detection_circle(bx, by, bw, bh)
-            if render_osd:
-                osd_img.draw_circle(
-                    circle_x, circle_y, circle_radius, color=col, thickness=2)
-                osd_img.draw_string_advanced(
-                    bx, max(0, by - 26), 22, DISPLAY_LABEL, color=col)
-        count = 1
-        best_score = capture["score"]
-
     ball_valid = control_state["valid"]
+    count = 1 if ball_valid else 0
+    best_score = capture["score"] if capture is not None else 0.0
+    if render_osd:
+        draw_tracking_marker(osd_img, control_state, tracker_state)
     pos_hist_full = ball_valid
     if ball_valid:
         filt_cx = control_state["x"]
@@ -1126,7 +1207,7 @@ def draw_osd(osd_img, capture, color_four, uart_obj, render_osd=True):
 # ============================================================
 
 def detection():
-    global state
+    global state, tracker_state, control_state, motion_samples
     print("=== Ball Position (new model) ===")
     wlan = None
 
@@ -1189,64 +1270,172 @@ def detection():
     gc_frame_count = 0
     perf_frame_count = 0
     perf_start_ms = time.ticks_ms()
+    blob_misses = 0
+    ai_failures = 0
+    predicted_frames = 0
+    tracker_state = TRACK_SEARCH
     print("AI loop start")
 
     try:
         while True:
             with ScopedTiming("total", debug_mode > 0):
-                rgb888p_img = sensor.snapshot(
-                    chn=CAM_CHN_ID_2, timeout=2000)
-                if first_ai_frame:
-                    print("AI first frame OK")
-                    first_ai_frame = False
-                    # LCD、摄像头和 AI 均正常后，再尝试启动一次 Wi-Fi。
+                blob_img = None
+                if blob_channel_available:
                     try:
-                        wlan = start_wifi()
+                        blob_img = sensor.snapshot(
+                            chn=CAM_CHN_ID_1, timeout=2000)
                     except BaseException as e:
-                        print("Wi-Fi disabled after initialization failure:", e)
-                    if wlan is not None:
-                        try:
-                            rtsp_server.start(wlan.ifconfig()[0])
-                        except BaseException as e:
-                            print("RTSP disabled after initialization failure:", e)
-                if rgb888p_img.format() == image.RGBP888:
-                    ai2d_input = rgb888p_img.to_numpy_ref()
-                    ai2d_input_tensor = nn.from_numpy(ai2d_input)
-                    ai2d_builder.run(ai2d_input_tensor, ai2d_output_tensor)
+                        print("Blob channel unavailable; KPU fallback active:", e)
+                        blob_channel_available = False
+                        tracker_state = TRACK_SEARCH
+                        blob_misses = 0
+                        ai_failures = 0
+                        predicted_frames = 0
 
-                    kpu.set_input_tensor(0, ai2d_output_tensor)
-                    kpu.run()
+                actions = hybrid_frame_actions(
+                    tracker_state, frame_counter + 1,
+                    blob_channel_available)
+                if actions == ("kpu",) and blob_img is not None:
+                    del blob_img
+                    blob_img = None
+                blob_valid = False
+                ai_valid = False
 
-                    results = []
-                    for i in range(kpu.outputs_size()):
-                        out_data = kpu.get_output_tensor(i)
-                        result   = out_data.to_numpy()
-                        result   = result.reshape(
-                            result.shape[0] * result.shape[1] *
-                            result.shape[2] * result.shape[3])
+                for action in actions:
+                    if action == "blob_control":
+                        dynamic_roi = blob_tracking_roi(control_state["x"])
+                        blob_capture = detect_blob_measurement(
+                            blob_img, dynamic_roi,
+                            control_state["x"], control_state["y"])
+                        del blob_img
+                        blob_img = None
+                        if blob_capture is not None:
+                            blob_x = blob_capture["x"] + blob_capture["w"] // 2
+                            blob_y = blob_capture["y"] + blob_capture["h"] // 2
+                            publish_measurement(
+                                blob_x, blob_y, "blob", time.ticks_ms())
+                            blob_valid = True
+                            blob_misses = 0
+                            predicted_frames = 0
+                        else:
+                            blob_misses += 1
+                            predicted_state, predicted_frames = (
+                                prediction_for_missed_frame(
+                                    control_state, predicted_frames,
+                                    time.ticks_ms()))
+                            if predicted_state is None:
+                                invalidate_control_state()
+                            else:
+                                control_state = predicted_state
+
+                        # Blob/prediction control is committed before a
+                        # validation KPU action later in this same tuple.
+                        publish_control_outputs(
+                            osd_img, None, color_four, uart)
+                        continue
+
+                    capture = None
+                    rgb888p_img = None
+                    ai2d_input = None
+                    ai2d_input_tensor = None
+                    results = None
+                    out_data = None
+                    result = None
+                    det_boxes = None
+                    try:
+                        rgb888p_img = sensor.snapshot(
+                            chn=CAM_CHN_ID_2, timeout=2000)
+                        if first_ai_frame:
+                            print("AI first frame OK")
+                            first_ai_frame = False
+                            # LCD、摄像头和 AI 均正常后，再尝试启动一次 Wi-Fi。
+                            try:
+                                wlan = start_wifi()
+                            except BaseException as e:
+                                print("Wi-Fi disabled after initialization failure:", e)
+                            if wlan is not None:
+                                try:
+                                    rtsp_server.start(wlan.ifconfig()[0])
+                                except BaseException as e:
+                                    print("RTSP disabled after initialization failure:", e)
+
+                        if rgb888p_img.format() == image.RGBP888:
+                            ai2d_input = rgb888p_img.to_numpy_ref()
+                            ai2d_input_tensor = nn.from_numpy(ai2d_input)
+                            ai2d_builder.run(
+                                ai2d_input_tensor, ai2d_output_tensor)
+
+                            kpu.set_input_tensor(0, ai2d_output_tensor)
+                            kpu.run()
+
+                            results = []
+                            for i in range(kpu.outputs_size()):
+                                out_data = kpu.get_output_tensor(i)
+                                result = out_data.to_numpy()
+                                result = result.reshape(
+                                    result.shape[0] * result.shape[1] *
+                                    result.shape[2] * result.shape[3])
+                                del out_data
+                                out_data = None
+                                results.append(result)
+
+                            det_boxes = aicube.anchorbasedet_post_process(
+                                results[0], results[1], results[2],
+                                kmodel_frame_size, frame_size, strides,
+                                num_classes, DETECT_CONF_THRESHOLD,
+                                nms_threshold, anchors, nms_option)
+                            capture = select_best_ai_ball(det_boxes)
+                    finally:
+                        del det_boxes
+                        del result
                         del out_data
-                        results.append(result)
+                        del results
+                        del ai2d_input_tensor
+                        del ai2d_input
+                        del rgb888p_img
 
-                    det_boxes = aicube.anchorbasedet_post_process(
-                        results[0], results[1], results[2],
-                        kmodel_frame_size, frame_size, strides,
-                        num_classes, DETECT_CONF_THRESHOLD,
-                        nms_threshold, anchors, nms_option)
-
-                    capture = select_best_ai_ball(det_boxes)
-                    if capture is not None:
-                        publish_measurement(
-                            capture["cx"], capture["cy"], "kpu", time.ticks_ms())
+                    ai_valid = capture is not None
+                    validation_only = (
+                        blob_channel_available and
+                        tracker_state == TRACK_ACTIVE)
+                    if validation_only:
+                        if ai_valid:
+                            blob_misses, ai_failures, predicted_frames = (
+                                ai_capture_counters(
+                                    tracker_state, blob_valid, blob_misses))
+                            if not blob_valid:
+                                motion_samples = []
+                                publish_measurement(
+                                    capture["cx"], capture["cy"],
+                                    "kpu", time.ticks_ms())
+                        else:
+                            ai_failures += 1
                     else:
-                        invalidate_control_state()
-                    render_osd = should_render_osd(
-                        frame_counter + 1, OSD_EVERY_N_FRAMES)
-                    if render_osd:
-                        osd_img.clear()
-                    draw_osd(
-                        osd_img, capture, color_four, uart, render_osd)
-                    if render_osd:
-                        Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
+                        if ai_valid:
+                            if (blob_channel_available and
+                                    tracker_state != TRACK_ACTIVE):
+                                motion_samples = []
+                            publish_measurement(
+                                capture["cx"], capture["cy"],
+                                "kpu", time.ticks_ms())
+                            blob_misses, ai_failures, predicted_frames = (
+                                ai_capture_counters(
+                                    tracker_state, blob_valid, blob_misses))
+                        elif (blob_channel_available and
+                              tracker_state == TRACK_RECOVER):
+                            predicted_state, predicted_frames = (
+                                prediction_for_missed_frame(
+                                    control_state, predicted_frames,
+                                    time.ticks_ms()))
+                            if predicted_state is None:
+                                invalidate_control_state()
+                            else:
+                                control_state = predicted_state
+                        else:
+                            invalidate_control_state()
+
+                        publish_control_outputs(
+                            osd_img, capture, color_four, uart)
 
                     perf_frame_count += 1
                     if perf_frame_count >= PERF_EVERY_N_FRAMES:
@@ -1260,11 +1449,22 @@ def detection():
                         perf_start_ms = perf_now_ms
                         perf_frame_count = 0
 
-                    del ai2d_input_tensor
-                    gc_frame_count += 1
-                    if gc_frame_count >= GC_EVERY_N_FRAMES:
-                        gc.collect()
-                        gc_frame_count = 0
+                if blob_channel_available:
+                    tracker_state = hybrid_transition(
+                        tracker_state, blob_valid, ai_valid,
+                        blob_misses, ai_failures)
+                else:
+                    tracker_state = TRACK_SEARCH
+                    blob_misses = 0
+                    ai_failures = 0
+                    predicted_frames = 0
+
+                if blob_img is not None:
+                    del blob_img
+                gc_frame_count += 1
+                if gc_frame_count >= GC_EVERY_N_FRAMES:
+                    gc.collect()
+                    gc_frame_count = 0
 
     except KeyboardInterrupt:
         print("=== Stop ===")
