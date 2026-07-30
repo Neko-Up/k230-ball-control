@@ -285,6 +285,13 @@ def smooth_box(old_box, new_box):
 # Wi-Fi
 # ============================================================
 
+def wifi_scan_channel_rssi(item):
+    if hasattr(item, "channel") and hasattr(item, "rssi"):
+        return int(item.channel), int(item.rssi)
+    if isinstance(item, dict):
+        return int(item["channel"]), int(item["rssi"])
+    return int(item[2]), int(item[3])
+
 
 def scan_best_channel():
     """
@@ -294,13 +301,14 @@ def scan_best_channel():
     sta = None
     try:
         sta = network.WLAN(network.STA_IF)
-        sta.active(True)
+        if not sta.active():
+            sta.active(True)
         result = sta.scan()
 
         busy = {1: 0, 6: 0, 11: 0}
 
         for item in result:
-            ssid, bssid, channel, rssi, auth, hidden = item
+            channel, rssi = wifi_scan_channel_rssi(item)
             if channel in busy:
                 # RSSI越强，占用权重越高
                 busy[channel] += max(0, 100 + rssi)
@@ -311,12 +319,6 @@ def scan_best_channel():
     except BaseException as e:
         print("Wi-Fi scan failed:", e)
         return 6
-    finally:
-        if sta is not None:
-            try:
-                sta.active(False)
-            except BaseException:
-                pass
 
 
 def select_default_network_device(device_name):
@@ -328,7 +330,8 @@ def select_default_network_device(device_name):
 def start_wifi():
     if WIFI_MODE == "ap":
         wlan = network.WLAN(network.AP_IF)
-        wlan.active(True)
+        if not wlan.active():
+            wlan.active(True)
         try:
             ap_channel = WIFI_AP_CHANNEL
             if ap_channel == 0:
@@ -348,7 +351,8 @@ def start_wifi():
         return wlan
 
     wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
+    if not wlan.active():
+        wlan.active(True)
     if not wlan.isconnected():
         print("Connecting Wi-Fi:", WIFI_STA_SSID)
         wlan.connect(WIFI_STA_SSID, WIFI_STA_PASSWORD)
@@ -365,6 +369,11 @@ def start_wifi():
 # ============================================================
 # VLC H.264/RTSP（WBC 合成画面 + 硬件编码）
 # ============================================================
+
+def rtsp_call_succeeded(result):
+    # 官方 CanMV API 返回 None；部分兼容固件沿用 C 风格的 0。
+    return result is None or result == 0
+
 
 class LowLatencyRtspH264Server:
     def __init__(self, width, height, port=RTSP_PORT,
@@ -484,13 +493,15 @@ class LowLatencyRtspH264Server:
         wbc_started = False
         try:
             self._encoder_create()
-            if self.rtsp.rtspserver_init(self.port) != 0:
+            init_result = self.rtsp.rtspserver_init(self.port)
+            if not rtsp_call_succeeded(init_result):
                 raise RuntimeError("RTSP failed to bind port {}".format(
                     self.port))
             self.rtsp_initialized = True
-            if self.rtsp.rtspserver_createsession(
-                    self.session_name,
-                    mm.multi_media_type.media_h264, False) != 0:
+            session_result = self.rtsp.rtspserver_createsession(
+                self.session_name,
+                mm.multi_media_type.media_h264, False)
+            if not rtsp_call_succeeded(session_result):
                 raise RuntimeError("RTSP session creation failed")
             self.rtsp.rtspserver_start()
             self._encoder_start()

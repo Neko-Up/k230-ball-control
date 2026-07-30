@@ -107,10 +107,31 @@ def test_control_interface_and_model_paths_are_unchanged():
     }
 
 
+def test_rtsp_void_and_zero_returns_are_successful():
+    rtsp_call_succeeded = load_pure_function("rtsp_call_succeeded")
+    assert rtsp_call_succeeded(None) is True
+    assert rtsp_call_succeeded(0) is True
+    assert rtsp_call_succeeded(-1) is False
+
+
+def test_wifi_scan_supports_firmware_info_objects():
+    wifi_scan_channel_rssi = load_pure_function("wifi_scan_channel_rssi")
+
+    class ScanInfo:
+        channel = 6
+        rssi = -42
+
+    assert wifi_scan_channel_rssi(ScanInfo()) == (6, -42)
+    assert wifi_scan_channel_rssi({"channel": 11, "rssi": -70}) == (11, -70)
+    assert wifi_scan_channel_rssi(("ssid", b"mac", 1, -55, 0, 0)) == (1, -55)
+
+
 if __name__ == "__main__":
     test_detection_circle_geometry()
     test_osd_updates_every_second_ai_frame()
     test_uart_updates_are_not_gated_by_osd_rendering()
     test_h264_rtsp_replaces_mjpeg_transport()
     test_control_interface_and_model_paths_are_unchanged()
+    test_rtsp_void_and_zero_returns_are_successful()
+    test_wifi_scan_supports_firmware_info_objects()
     print("tests: OK")
