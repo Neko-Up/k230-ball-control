@@ -19,7 +19,7 @@ ball position error + ball velocity
                  v
           target rod angle
                  |
-          clamp to +/-1.0 deg
+          clamp to +/-2.0 deg
                  |
                  v
  estimated rod angle error
@@ -30,9 +30,9 @@ ball position error + ball velocity
 
 ## Limits and Initial Parameters
 
-- Rod angle limit: +/-1.0 degree.
+- Rod angle limit: +/-2.0 degrees for fast edge recovery.
 - Ball-position deadband: +/-0.15 cm.
-- Step frequency range: 40-500 Hz.
+- Step frequency range: 150-400 Hz.
 - Direction changes must decelerate to zero before reversing.
 - Inside the ball-position deadband, the target rod angle returns toward zero.
 - Existing pulse conversion remains 8.8889 pulses per rod degree unless the
@@ -49,22 +49,22 @@ fast large-angle correction.
 - Invalid or stale vision data immediately stops STEP output and disables EN.
 - The software watchdog remains active and must use a valid, reusable CanMV
   Timer lifecycle.
-- Estimated rod angle is always clamped to +/-1.0 degree.
+- Estimated rod angle is always clamped to +/-2.0 degrees.
 - Reaching an angle boundary prevents further motion into that boundary but
   still permits motion back toward zero.
 
 ## Display and UART
 
 LCD and UART continue to publish the same real-time fields. The displayed `A`
-field represents estimated rod angle and must remain within +/-1.0 degree. No
+field represents estimated rod angle and must remain within +/-2.0 degrees. No
 additional filtering may delay the vision measurements sent to the controller.
 
 ## Verification
 
 Automated tests must cover:
 
-- Target angle is clamped to +/-1.0 degree.
-- A large ball error cannot command more than +/-1.0 degree.
+- Target angle is clamped to +/-2.0 degrees.
+- A large ball error cannot command more than +/-2.0 degrees.
 - Deadband commands the rod back toward zero.
 - Direction reversal first reduces output to zero.
 - Invalid vision disables the driver.
@@ -74,6 +74,6 @@ On-board acceptance:
 
 1. Level the rod and tap zero.
 2. Move the ball 1-5 cm from target.
-3. Confirm the rod never exceeds +/-1.0 degree.
+3. Confirm the rod never exceeds +/-2.0 degrees.
 4. Confirm the rod returns near zero as the ball enters the deadband.
 5. Confirm no LCD blackout or runtime exception occurs.

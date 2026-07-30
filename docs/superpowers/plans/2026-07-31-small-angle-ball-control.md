@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace direct ball-error-to-frequency control with a bounded two-stage controller whose rod target never exceeds +/-1.0 degree.
+**Goal:** Replace direct ball-error-to-frequency control with a bounded two-stage controller whose rod target never exceeds +/-2.0 degrees during edge recovery.
 
 **Architecture:** The existing vision measurement remains unchanged. A pure outer PD calculation produces `target_angle_deg`; a pure inner position tracker compares that target with the estimated rod angle and produces bounded STEP frequency and direction. The existing `D36AStepper`, touch-zero flow, LCD/UART publishing, and reusable software watchdog execute the resulting command unchanged.
 
@@ -10,9 +10,9 @@
 
 ## Global Constraints
 
-- Rod angle limit is exactly +/-1.0 degree.
+- Rod angle limit is exactly +/-2.0 degrees.
 - Ball-position deadband is exactly +/-0.15 cm.
-- STEP frequency is limited to 40-500 Hz.
+- STEP frequency is limited to 150-400 Hz.
 - Direction reversal must decelerate to zero before switching.
 - Invalid or stale vision data immediately stops STEP and disables EN.
 - Pulse conversion remains 8.8889 pulses per rod degree.
@@ -285,7 +285,7 @@ Verify the camera, LCD, touch-zero button, ball position, target angle, and UART
 
 - [ ] **Step 2: Enable the D36A with the rod level**
 
-Tap zero and verify the estimated and target angle remain within +/-1.0 degree.
+Tap zero and verify the estimated and target angle remain within +/-2.0 degrees.
 
 - [ ] **Step 3: Test small ball offsets**
 
@@ -297,7 +297,7 @@ Temporarily cover the ball and verify UART reports `vision_invalid`, STEP output
 
 - [ ] **Step 5: Tune only gains, one at a time**
 
-If the ball reacts too slowly, raise `STEPPER_KP_ANGLE_DEG_PER_CM` in increments of `0.02`. If it overshoots, raise `STEPPER_KD_ANGLE_DEG_PER_CM_S` in increments of `0.01`. Never increase `STEPPER_ANGLE_LIMIT_DEG` above `1.0` during initial acceptance.
+The field-tuned values are `KP=0.45`, `KD=0.06`, tracking gain `1200 Hz/deg`, `150-400 Hz`, and an `8000 Hz/s` ramp. Do not increase `STEPPER_ANGLE_LIMIT_DEG` above `2.0` without a new physical safety review.
 
 - [ ] **Step 6: Commit measured tuning values**
 
