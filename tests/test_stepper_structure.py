@@ -32,7 +32,7 @@ def test_field_tuning_prioritizes_fast_edge_recovery():
     assert assigned_value("STEPPER_MIN_FREQUENCY_HZ") == 150.0
     assert assigned_value("STEPPER_MAX_FREQUENCY_HZ") == 400.0
     assert assigned_value("STEPPER_FREQUENCY_RAMP_HZ_S") == 8000.0
-    assert assigned_value("STEPPER_ANGLE_LIMIT_DEG") == 5.0
+    assert assigned_value("STEPPER_ANGLE_LIMIT_DEG") == 16.0
 
 
 def test_d36a_adapter_owns_pwm_direction_and_active_high_enable():
