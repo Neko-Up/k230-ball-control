@@ -340,7 +340,7 @@ class D36AStepper:
         self.dir_pin.value(0)
         self.pwm = PWM(
             STEPPER_PWM_CHANNEL,
-            int(STEPPER_MIN_FREQUENCY_HZ), 50, enable=False)
+            freq=int(STEPPER_MIN_FREQUENCY_HZ), duty=50, enable=False)
         self.running = False
         self.last_frequency_hz = 0
         self.last_direction = 0

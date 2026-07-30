@@ -34,6 +34,15 @@ def test_d36a_adapter_owns_pwm_direction_and_active_high_enable():
     assert {"__init__", "apply", "stop", "deinit"} <= set(methods)
     init_text = ast.unparse(methods["__init__"])
     assert "PWM(STEPPER_PWM_CHANNEL" in init_text
+    pwm_call = next(
+        node for node in ast.walk(methods["__init__"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "PWM"
+    )
+    assert len(pwm_call.args) == 1
+    assert {item.arg for item in pwm_call.keywords} == {
+        "freq", "duty", "enable",
+    }
     assert "enable=False" in init_text
     assert "self.en_pin.value(0)" in init_text
     apply_text = ast.unparse(methods["apply"])
