@@ -43,21 +43,20 @@ def test_d36a_adapter_owns_pwm_direction_and_active_high_enable():
     assert pwm_call.keywords == []
     assert "self.pwm.freq(int(STEPPER_MIN_FREQUENCY_HZ))" in init_text
     assert "self.pwm.duty(0)" in init_text
-    assert "self.pwm.enable(False)" in init_text
+    assert ".enable(" not in init_text
     assert "self.en_pin.value(0)" in init_text
     apply_text = ast.unparse(methods["apply"])
     assert "self.dir_pin.value" in apply_text
     assert "self.pwm.freq" in apply_text
     assert "self.en_pin.value(1)" in apply_text
-    assert "self.pwm.enable(True)" in apply_text
+    assert ".enable(" not in apply_text
     assert "self.last_direction" in apply_text
-    assert "self.pwm.enable(False)" in apply_text
     assert "self.pwm.duty(50)" in apply_text
     assert "self.watchdog.init" in apply_text
     assert "except Exception" in apply_text
     assert "self.stop(disable=True)" in apply_text
     stop_text = ast.unparse(methods["stop"])
-    assert "self.pwm.enable(False)" in stop_text
+    assert ".enable(" not in stop_text
     assert "self.pwm.duty(0)" in stop_text
     assert "self.en_pin.value(0)" in stop_text
     assert "self.en_pin.value(1)" in stop_text

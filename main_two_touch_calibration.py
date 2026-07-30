@@ -341,7 +341,6 @@ class D36AStepper:
         self.pwm = PWM(STEPPER_PWM_CHANNEL)
         self.pwm.freq(int(STEPPER_MIN_FREQUENCY_HZ))
         self.pwm.duty(0)
-        self.pwm.enable(False)
         self.running = False
         self.last_frequency_hz = 0
         self.last_direction = 0
@@ -362,7 +361,6 @@ class D36AStepper:
         direction = 1 if command["direction"] > 0 else -1
         if self.running and direction != self.last_direction:
             self.pwm.duty(0)
-            self.pwm.enable(False)
             self.running = False
         self.dir_pin.value(1 if direction > 0 else 0)
         if direction != self.last_direction:
@@ -374,7 +372,6 @@ class D36AStepper:
         self.en_pin.value(1)
         if not self.running:
             self.pwm.duty(50)
-            self.pwm.enable(True)
             self.running = True
         try:
             self.watchdog.init(
@@ -393,7 +390,6 @@ class D36AStepper:
         try:
             if self.running:
                 self.pwm.duty(0)
-                self.pwm.enable(False)
         finally:
             self.running = False
             self.last_frequency_hz = 0
