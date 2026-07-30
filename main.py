@@ -93,6 +93,7 @@ MAX_DETECTIONS_PER_FRAME = 25
 PRINT_EVERY_N_FRAMES     = 30
 GC_EVERY_N_FRAMES        = 60      # 降低强制 GC 频率，减少周期性停顿
 PERF_EVERY_N_FRAMES      = 60      # 低频统计实际 AI 主循环性能
+OSD_EVERY_N_FRAMES       = 2       # 控制/UART 全帧运行，叠加层隔帧刷新
 DISPLAY_LABEL            = "gz"
 MERGED_CLASS_ID          = 0       # 新模型只有 gangqiu 一个类
 MIN_BOX_SIZE             = 4
@@ -638,7 +639,11 @@ def detection_circle(bx, by, bw, bh):
     return cx, cy, radius
 
 
-def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
+def should_render_osd(frame_number, cadence=2):
+    return frame_number % cadence == 0
+
+
+def draw_osd(osd_img, stable_tracks, color_four, uart_obj, render_osd=True):
     global frame_counter, state
     global pos_hist_full
     global calib_stable_count, calib_last_cx, calib_last_cy
@@ -674,13 +679,16 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
 
         col = color_four[MERGED_CLASS_ID][1:]
         circle_x, circle_y, circle_radius = detection_circle(bx, by, bw, bh)
-        osd_img.draw_circle(
-            circle_x, circle_y, circle_radius, color=col, thickness=2)
+        if render_osd:
+            osd_img.draw_circle(
+                circle_x, circle_y, circle_radius, color=col, thickness=2)
 
         tcx = int((x1 + x2) / 2)
         tcy = int((y1 + y2) / 2)
         lbl = DISPLAY_LABEL + ("*" if trk["lost"] > 0 else "")
-        osd_img.draw_string_advanced(bx, max(0, by - 26), 22, lbl, color=col)
+        if render_osd:
+            osd_img.draw_string_advanced(
+                bx, max(0, by - 26), 22, lbl, color=col)
         count += 1
         if trk["score"] > best_score:
             best_score = trk["score"]
@@ -702,7 +710,7 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
         flash_on = ((frame_counter // 15) % 2 == 0)
 
         # 在画面几何中心画准星 (仅作视觉参考)
-        if flash_on:
+        if render_osd and flash_on:
             osd_img.draw_circle(gc_dx, gc_dy, 40, color=C_GREEN, thickness=3)
             osd_img.draw_circle(gc_dx, gc_dy, 20, color=C_GREEN, thickness=2)
             osd_img.draw_line(gc_dx - 50, gc_dy, gc_dx + 50, gc_dy,
@@ -737,11 +745,14 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
             tip_color = C_WHITE
 
         # 在球所在位置上方显示提示
-        if ball_valid and pos_hist_full:
-            bx, by = ai_to_disp(filt_cx, filt_cy)
-            osd_img.draw_string_advanced(bx - 50, by - 50, 22, tip, color=tip_color)
-        else:
-            osd_img.draw_string_advanced(gc_dx - 70, gc_dy - 80, 26, tip, color=tip_color)
+        if render_osd:
+            if ball_valid and pos_hist_full:
+                bx, by = ai_to_disp(filt_cx, filt_cy)
+                osd_img.draw_string_advanced(
+                    bx - 50, by - 50, 22, tip, color=tip_color)
+            else:
+                osd_img.draw_string_advanced(
+                    gc_dx - 70, gc_dy - 80, 26, tip, color=tip_color)
 
         # 进度条
         bar_w = 120
@@ -749,10 +760,13 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
         bar_x = gc_dx - bar_w // 2
         bar_y = gc_dy + 70
         progress = min(1.0, calib_stable_count / CALIB_DURATION_FRAMES)
-        osd_img.draw_rectangle(bar_x, bar_y, bar_w, bar_h, color=C_WHITE, thickness=1)
-        if progress > 0:
-            fill_w = int(bar_w * progress)
-            osd_img.draw_rectangle(bar_x, bar_y, fill_w, bar_h, color=C_GREEN, thickness=-1)
+        if render_osd:
+            osd_img.draw_rectangle(
+                bar_x, bar_y, bar_w, bar_h, color=C_WHITE, thickness=1)
+            if progress > 0:
+                fill_w = int(bar_w * progress)
+                osd_img.draw_rectangle(
+                    bar_x, bar_y, fill_w, bar_h, color=C_GREEN, thickness=-1)
 
         # 校准完成
         if calib_stable_count >= CALIB_DURATION_FRAMES:
@@ -771,17 +785,18 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
 
         if calib_done_flash > 0:
             calib_done_flash -= 1
-            if calib_done_flash % 10 < 5:
+            if render_osd and calib_done_flash % 10 < 5:
                 osd_img.draw_string_advanced(cal_dx - 50, cal_dy - 60, 28,
                     "CALIB OK!", color=C_GREEN)
 
         # 蓝色准星 (校准零点)
-        osd_img.draw_circle(cal_dx, cal_dy, 16, color=C_BLUE, thickness=2)
-        osd_img.draw_circle(cal_dx, cal_dy, 6,  color=C_BLUE, thickness=2)
-        osd_img.draw_line(cal_dx - 25, cal_dy, cal_dx + 25, cal_dy,
-                          color=C_BLUE, thickness=2)
-        osd_img.draw_line(cal_dx, cal_dy - 25, cal_dx, cal_dy + 25,
-                          color=C_BLUE, thickness=2)
+        if render_osd:
+            osd_img.draw_circle(cal_dx, cal_dy, 16, color=C_BLUE, thickness=2)
+            osd_img.draw_circle(cal_dx, cal_dy, 6,  color=C_BLUE, thickness=2)
+            osd_img.draw_line(cal_dx - 25, cal_dy, cal_dx + 25, cal_dy,
+                              color=C_BLUE, thickness=2)
+            osd_img.draw_line(cal_dx, cal_dy - 25, cal_dx, cal_dy + 25,
+                              color=C_BLUE, thickness=2)
 
         if ball_valid and pos_hist_full:
             dx = filt_cx - calib_cx
@@ -801,32 +816,34 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
             dist_mm = total_distance_px * PIXEL_TO_MM
             current_deviation = {"dx": dx, "dy": dy, "valid": True, "dist_mm": dist_mm}
 
-            ball_dx, ball_dy = ai_to_disp(filt_cx, filt_cy)
-            osd_img.draw_line(ball_dx, ball_dy, cal_dx, cal_dy,
-                              color=C_YELLOW, thickness=1)
+            if render_osd:
+                ball_dx, ball_dy = ai_to_disp(filt_cx, filt_cy)
+                osd_img.draw_line(ball_dx, ball_dy, cal_dx, cal_dy,
+                                  color=C_YELLOW, thickness=1)
 
-            info_x = DISPLAY_WIDTH - 150
-            osd_img.draw_string_advanced(info_x, 10, 22,
-                "dX:{:+04d}".format(dx), color=C_WHITE)
-            osd_img.draw_string_advanced(info_x, 34, 22,
-                "dY:{:+04d}".format(dy), color=C_WHITE)
-            osd_img.draw_string_advanced(info_x, 60, 20,
-                "dist:{:.0f}mm".format(dist_mm), color=C_ORANGE)
+                info_x = DISPLAY_WIDTH - 150
+                osd_img.draw_string_advanced(info_x, 10, 22,
+                    "dX:{:+04d}".format(dx), color=C_WHITE)
+                osd_img.draw_string_advanced(info_x, 34, 22,
+                    "dY:{:+04d}".format(dy), color=C_WHITE)
+                osd_img.draw_string_advanced(info_x, 60, 20,
+                    "dist:{:.0f}mm".format(dist_mm), color=C_ORANGE)
 
-            osd_img.draw_string_advanced(10, 10, 22,
-                "Ball:{}".format(count), color=C_WHITE)
-            osd_img.draw_string_advanced(10, 34, 18,
-                "s:{:.2f}".format(best_score), color=C_WHITE)
+                osd_img.draw_string_advanced(10, 10, 22,
+                    "Ball:{}".format(count), color=C_WHITE)
+                osd_img.draw_string_advanced(10, 34, 18,
+                    "s:{:.2f}".format(best_score), color=C_WHITE)
         else:
             last_valid_cx = -1
             last_valid_cy = -1
             current_deviation = {"dx": 0, "dy": 0, "valid": False,
                                  "dist_mm": total_distance_px * PIXEL_TO_MM}
-            osd_img.draw_string_advanced(10, 10, 22, "Ball:0", color=C_RED)
-            osd_img.draw_string_advanced(DISPLAY_WIDTH - 150, 10, 22,
-                "dX:----", color=C_RED)
-            osd_img.draw_string_advanced(DISPLAY_WIDTH - 150, 34, 22,
-                "dY:----", color=C_RED)
+            if render_osd:
+                osd_img.draw_string_advanced(10, 10, 22, "Ball:0", color=C_RED)
+                osd_img.draw_string_advanced(DISPLAY_WIDTH - 150, 10, 22,
+                    "dX:----", color=C_RED)
+                osd_img.draw_string_advanced(DISPLAY_WIDTH - 150, 34, 22,
+                    "dY:----", color=C_RED)
 
     # ---- UART发送 ----
     if frame_counter % SEND_EVERY_N_FRAMES == 0:
@@ -998,9 +1015,14 @@ def detection():
                         nms_threshold, anchors, nms_option)
 
                     stable_tracks = update_tracks(det_boxes)
-                    osd_img.clear()
-                    draw_osd(osd_img, stable_tracks, color_four, uart)
-                    Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
+                    render_osd = should_render_osd(
+                        frame_counter + 1, OSD_EVERY_N_FRAMES)
+                    if render_osd:
+                        osd_img.clear()
+                    draw_osd(
+                        osd_img, stable_tracks, color_four, uart, render_osd)
+                    if render_osd:
+                        Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
 
                     perf_frame_count += 1
                     if perf_frame_count >= PERF_EVERY_N_FRAMES:
