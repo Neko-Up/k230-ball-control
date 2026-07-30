@@ -168,7 +168,7 @@ STEPPER_ANGLE_LIMIT_DEG = 8.0
 STEPPER_DIRECTION_INVERT = False
 STEPPER_VISION_TIMEOUT_MS = 150
 STEPPER_WATCHDOG_TIMER_ID = -1  # software timer; media pipeline owns hard timers
-STEPPER_ZERO_TOUCH_RECT = (180, 190, 440, 100)
+STEPPER_ZERO_TOUCH_RECT = (210, 398, 380, 58)
 STEPPER_ZERO_TOUCH_EVENT = TOUCH_RELEASE_EVENT
 
 # One-touch target calibration. The official O is always pipe midpoint.
@@ -1905,15 +1905,6 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
         if mode == CAL_WAIT_TARGET:
             osd_img.draw_string_advanced(
                 215, 20, 28, "Tap target point", color=C_CYAN_TEXT)
-        elif not stepper_state.get("zeroed", False):
-            zero_x, zero_y, zero_w, zero_h = STEPPER_ZERO_TOUCH_RECT
-            osd_img.draw_rectangle(
-                zero_x, zero_y, zero_w, zero_h,
-                color=C_CYAN_TEXT, thickness=4)
-            osd_img.draw_string_advanced(
-                zero_x + 32, zero_y + 34, 28,
-                "LEVEL ROD, TAP TO ZERO",
-                color=C_CYAN_TEXT)
         elif measurement["valid"]:
             ball_dx, ball_dy = ai_to_disp(
                 measurement["ball_point"][0], measurement["ball_point"][1])
@@ -1937,31 +1928,47 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
                 target_dx - 8, target_dy - 32, 18, "T", color=C_WHITE)
             osd_img.draw_string_advanced(
                 DISPLAY_WIDTH - 240, 10, 22,
-                "B:{:+.2f}cm".format(measurement["ball_position_cm"]),
+                "O:{:+.2f}cm".format(measurement["ball_position_cm"]),
                 color=C_GREEN_TEXT if measurement["valid"] else C_RED)
             osd_img.draw_string_advanced(
                 DISPLAY_WIDTH - 240, 36, 20,
+                "|O-B|:{:.2f}cm".format(
+                    abs(measurement["ball_position_cm"])),
+                color=C_GREEN_TEXT)
+            osd_img.draw_string_advanced(
+                DISPLAY_WIDTH - 240, 62, 20,
                 "T:{:+.2f}cm".format(measurement["target_position_cm"]),
                 color=C_WHITE)
             osd_img.draw_string_advanced(
-                DISPLAY_WIDTH - 240, 61, 22,
+                DISPLAY_WIDTH - 240, 88, 22,
                 "E:{:+.2f}cm".format(measurement["error_cm"]),
                 color=C_GREEN_TEXT)
             osd_img.draw_string_advanced(
-                DISPLAY_WIDTH - 240, 88, 15,
-                "Hold 2s: new target", color=C_WHITE)
-            osd_img.draw_string_advanced(
-                DISPLAY_WIDTH - 240, 110, 17,
+                DISPLAY_WIDTH - 240, 116, 17,
                 "F:{:04d}Hz D:{:+d}".format(
                     int(round(stepper_state.get("frequency_hz", 0.0))),
                     int(stepper_state.get("direction", 0))),
                 color=C_WHITE)
             osd_img.draw_string_advanced(
-                DISPLAY_WIDTH - 240, 132, 17,
+                DISPLAY_WIDTH - 240, 140, 17,
                 "A:{:+.2f} {}".format(
                     stepper_state.get("estimated_angle_deg", 0.0),
                     stepper_state.get("fault", "unknown")),
                 color=C_GREEN_TEXT if stepper_state.get("enabled") else C_WHITE)
+            osd_img.draw_string_advanced(
+                DISPLAY_WIDTH - 240, 164, 15,
+                "Hold 2s: new target", color=C_WHITE)
+
+        if (mode == CAL_READY and
+                not stepper_state.get("zeroed", False)):
+            zero_x, zero_y, zero_w, zero_h = STEPPER_ZERO_TOUCH_RECT
+            osd_img.draw_rectangle(
+                zero_x, zero_y, zero_w, zero_h,
+                color=C_CYAN_TEXT, thickness=3)
+            osd_img.draw_string_advanced(
+                zero_x + 42, zero_y + 17, 20,
+                "LEVEL ROD - TAP ZERO",
+                color=C_CYAN_TEXT)
 
     # ---- UART发送 ----
     if frame_counter % SEND_EVERY_N_FRAMES == 0:

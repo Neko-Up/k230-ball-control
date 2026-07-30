@@ -98,3 +98,17 @@ def test_stepper_uart_frame_exposes_realtime_command():
         "fault": "none",
     })
     assert message == b"M:1,R:1,F:0345,D:-1,A:+1.25,E:none\n"
+
+
+def test_axis_distance_is_drawn_before_zero_prompt_overlay():
+    draw = next(
+        node for node in TREE.body
+        if isinstance(node, ast.FunctionDef) and node.name == "draw_osd"
+    )
+    source = ast.unparse(draw)
+    measurement_branch = source.find("elif measurement['valid']")
+    distance_label = source.find("|O-B|:{:.2f}cm")
+    zero_prompt = source.find("LEVEL ROD - TAP ZERO")
+    assert measurement_branch >= 0
+    assert distance_label > measurement_branch
+    assert zero_prompt > distance_label
