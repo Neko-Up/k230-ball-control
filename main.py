@@ -68,7 +68,7 @@ WIFI_CONNECT_MS   = 15000
 RTSP_PORT         = 8554
 RTSP_SESSION      = "ball"
 H264_BITRATE      = 1000       # Kbit/s
-H264_FPS          = 15
+H264_FPS          = 30         # 匹配摄像头/WBC，避免消费过慢形成帧积压
 H264_GOP          = 15
 
 def format_iso_time(epoch_s=None, millis=0):

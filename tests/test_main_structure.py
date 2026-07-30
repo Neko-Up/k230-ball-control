@@ -77,7 +77,7 @@ def test_h264_rtsp_replaces_mjpeg_transport():
     assert assignments == {
         "RTSP_PORT": 8554,
         "RTSP_SESSION": "ball",
-        "H264_FPS": 15,
+        "H264_FPS": 30,
     }
 
 
