@@ -332,11 +332,11 @@ def select_best_ai_ball(det_boxes):
         y2 = float(det[5])
         width = x2 - x1
         height = y2 - y1
-        if width < 4 or height < 4:
+        if width < MIN_BOX_SIZE or height < MIN_BOX_SIZE:
             continue
-        if width > 170 or height > 170:
+        if width > MAX_BOX_SIZE or height > MAX_BOX_SIZE:
             continue
-        if max(width, height) / min(width, height) > 1.8:
+        if max(width, height) / min(width, height) > MAX_ASPECT_RATIO:
             continue
         if best_capture is None or score > best_capture["score"]:
             best_capture = {

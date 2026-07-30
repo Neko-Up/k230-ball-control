@@ -4,6 +4,14 @@ from pathlib import Path
 
 SOURCE = Path(__file__).parents[1] / "main.py"
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
+AI_BALL_LIMITS = {
+    target.id: ast.literal_eval(item.value)
+    for item in TREE.body
+    if isinstance(item, ast.Assign)
+    for target in item.targets
+    if isinstance(target, ast.Name)
+    and target.id in {"MIN_BOX_SIZE", "MAX_BOX_SIZE", "MAX_ASPECT_RATIO"}
+}
 
 
 def load_pure_function(name, namespace=None):
@@ -17,9 +25,11 @@ def load_pure_function(name, namespace=None):
     )
     assert node is not None, "{} is missing".format(name)
     module = ast.Module(body=[node], type_ignores=[])
-    namespace = {} if namespace is None else dict(namespace)
-    exec(compile(module, str(SOURCE), "exec"), namespace)
-    return namespace[name]
+    injected_namespace = dict(AI_BALL_LIMITS)
+    if namespace is not None:
+        injected_namespace.update(namespace)
+    exec(compile(module, str(SOURCE), "exec"), injected_namespace)
+    return injected_namespace[name]
 
 
 def test_detection_circle_geometry():
@@ -39,6 +49,18 @@ def test_single_ai_capture_selects_highest_valid_confidence():
     assert result["cx"] == 115
     assert result["cy"] == 115
     assert result["score"] == 0.90
+
+
+def test_single_ai_capture_rejects_invalid_configured_boxes():
+    select_best_ai_ball = load_pure_function(
+        "select_best_ai_ball",
+        {"MIN_BOX_SIZE": 20, "MAX_BOX_SIZE": 170, "MAX_ASPECT_RATIO": 1.8},
+    )
+    detections = [
+        [0, 0.99, 0, 0, 10, 10],
+        [0, 0.80, 0, 0, 40, 20],
+    ]
+    assert select_best_ai_ball(detections) is None
 
 
 def test_three_sample_velocity_and_bounded_prediction():
@@ -164,6 +186,7 @@ def test_wifi_scan_supports_firmware_info_objects():
 if __name__ == "__main__":
     test_detection_circle_geometry()
     test_single_ai_capture_selects_highest_valid_confidence()
+    test_single_ai_capture_rejects_invalid_configured_boxes()
     test_three_sample_velocity_and_bounded_prediction()
     test_osd_updates_at_the_requested_cadence()
     test_control_ui_is_full_rate_and_rtc_is_removed()
