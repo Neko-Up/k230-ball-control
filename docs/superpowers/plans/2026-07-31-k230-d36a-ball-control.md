@@ -29,10 +29,10 @@
 - Consumes: target/ball positions in centimeters, ball velocity in cm/s, elapsed seconds, zeroed flag, and vision validity.
 - Produces: `compute_stepper_command(...) -> dict` with `enabled`, `direction`, `frequency_hz`, `estimated_angle_deg`, and `fault`.
 
-- [ ] Write failing tests for deadband, direction, derivative damping, frequency clamp/ramp, angle limits, and invalid-vision shutdown.
-- [ ] Run `python -m pytest tests/test_stepper_control.py -q` and confirm failure because the API does not exist.
-- [ ] Add configuration constants and pure control functions without importing K230-only modules.
-- [ ] Run the focused tests and confirm all pass.
+- [x] Write failing tests for deadband, direction, derivative damping, frequency clamp/ramp, angle limits, and invalid-vision shutdown.
+- [x] Run `python -m pytest tests/test_stepper_control.py -q` and confirm failure because the API does not exist.
+- [x] Add configuration constants and pure control functions without importing K230-only modules.
+- [x] Run the focused tests and confirm all pass.
 
 ### Task 2: D36A hardware adapter and safe shutdown
 
@@ -44,10 +44,10 @@
 - Consumes: command dictionary from Task 1.
 - Produces: `D36AStepper.apply(command)`, `D36AStepper.stop(disable=True)`, and `D36AStepper.deinit()`.
 
-- [ ] Write failing structural tests requiring IO42/PWM0 STEP, IO5 DIR, IO6 EN, active-high EN, PWM frequency update, and `finally` cleanup.
-- [ ] Run the focused test and confirm it fails on the missing adapter.
-- [ ] Implement the FPIOA/PWM/GPIO adapter with startup disabled and idempotent shutdown.
-- [ ] Run the focused test and confirm it passes.
+- [x] Write failing structural tests requiring IO42/PWM0 STEP, IO5 DIR, IO6 EN, active-high EN, PWM frequency update, and `finally` cleanup.
+- [x] Run the focused test and confirm it fails on the missing adapter.
+- [x] Implement the FPIOA/PWM/GPIO adapter with startup disabled and idempotent shutdown.
+- [x] Run the focused test and confirm it passes.
 
 ### Task 3: Manual-zero touch state and real-time integration
 
@@ -59,19 +59,19 @@
 - Consumes: existing touch points and `axis_measurement(...)` output.
 - Produces: an armed/zeroed state, immediate driver updates after valid measurements, LCD status, and extended UART telemetry.
 
-- [ ] Write failing tests that require motor-disabled startup, a dedicated touch-to-zero action, update-before-LCD ordering, stale/lost-ball shutdown, and control telemetry fields.
-- [ ] Run the focused test and confirm expected failures.
-- [ ] Add the zero/arm UI state, control update call, low-rate LCD fields, and compact UART fields.
-- [ ] Ensure exceptions and normal exit call `deinit()` before other teardown.
-- [ ] Run the focused integration tests and confirm they pass.
+- [x] Write failing tests that require motor-disabled startup, a dedicated touch-to-zero action, update-before-LCD ordering, stale/lost-ball shutdown, and control telemetry fields.
+- [x] Run the focused test and confirm expected failures.
+- [x] Add the zero/arm UI state, control update call, low-rate LCD fields, and compact UART fields.
+- [x] Ensure exceptions and normal exit call `deinit()` before other teardown.
+- [x] Run the focused integration tests and confirm they pass.
 
 ### Task 4: Regression verification and delivery
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-07-31-k230-d36a-ball-control.md`
 
-- [ ] Run `python -m pytest -q` and confirm zero failures.
-- [ ] Run `python -m py_compile main_two_touch_calibration.py` and confirm syntax success.
-- [ ] Run `git diff --check` and inspect the complete diff for unrelated changes.
-- [ ] Update this plan's checkboxes, commit only tracked implementation/test/plan files, and leave `main_green_pipe_tracking.py` untouched.
+- [x] Run `python -m pytest -q` and confirm zero failures.
+- [x] Run `python -m py_compile main_two_touch_calibration.py` and confirm syntax success.
+- [x] Run `git diff --check` and inspect the complete diff for unrelated changes.
+- [x] Update this plan's checkboxes, commit only tracked implementation/test/plan files, and leave `main_green_pipe_tracking.py` untouched.
 - [ ] Push branch `agent/h264-circle-stream` and report the exact wiring, DIP settings, startup procedure, and hardware-only validation still required.

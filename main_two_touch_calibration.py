@@ -24,7 +24,7 @@ import uos
 import ulab.numpy as np
 from libs.PipeLine import ScopedTiming
 from libs.Utils import *
-from machine import FPIOA, UART, TOUCH
+from machine import FPIOA, UART, TOUCH, PWM, Pin, Timer
 from media.display import *
 from media.media import *
 from media.sensor import *
@@ -152,6 +152,25 @@ UART_BAUDRATE       = 115200
 SEND_EVERY_N_FRAMES = 1
 DEVIATION_DEADZONE  = 3
 
+# D36A stepper: physical header pins 13/11/12 -> IO42/IO5/IO6.
+STEPPER_STEP_IO = 42
+STEPPER_PWM_CHANNEL = 0
+STEPPER_DIR_IO = 5
+STEPPER_EN_IO = 6
+STEPPER_KP_HZ_PER_CM = 400.0
+STEPPER_KD_HZ_PER_CM_S = 30.0
+STEPPER_DEADBAND_CM = 0.20
+STEPPER_MIN_FREQUENCY_HZ = 120.0
+STEPPER_MAX_FREQUENCY_HZ = 1800.0
+STEPPER_FREQUENCY_RAMP_HZ_S = 4000.0
+STEPPER_PULSES_PER_ROD_DEG = 8.8889  # 1.8 deg motor, 1/16, direct drive
+STEPPER_ANGLE_LIMIT_DEG = 8.0
+STEPPER_DIRECTION_INVERT = False
+STEPPER_VISION_TIMEOUT_MS = 150
+STEPPER_WATCHDOG_TIMER_ID = 5
+STEPPER_ZERO_TOUCH_RECT = (180, 190, 440, 100)
+STEPPER_ZERO_TOUCH_EVENT = TOUCH_RELEASE_EVENT
+
 # One-touch target calibration. The official O is always pipe midpoint.
 CALIBRATION_VERSION = 2
 CALIBRATION_PATH = "/sdcard/ball_axis_calibration.json"
@@ -207,6 +226,184 @@ def estimate_velocity(samples, ticks_diff_fn=None):
         sum(item[0] for item in velocities) / len(velocities),
         sum(item[1] for item in velocities) / len(velocities),
     )
+
+
+def new_stepper_control_state(now_ms=0):
+    return {
+        "zeroed": False,
+        "frequency_hz": 0.0,
+        "direction": 0,
+        "motion_sign": 0,
+        "estimated_angle_deg": 0.0,
+        "last_update_ms": now_ms,
+        "fault": "not_zeroed",
+    }
+
+
+def compute_stepper_command(
+        error_cm, velocity_cm_s, measurement_valid, zeroed,
+        now_ms, state, kp_hz_per_cm, kd_hz_per_cm_s,
+        deadband_cm, min_frequency_hz, max_frequency_hz,
+        frequency_ramp_hz_s, pulses_per_degree, angle_limit_deg,
+        max_motion_ms,
+        direction_invert=False, ticks_diff_fn=None):
+    """Return the next safe D36A command without touching hardware."""
+    if ticks_diff_fn is None:
+        elapsed_ms = time.ticks_diff(now_ms, state["last_update_ms"])
+    else:
+        elapsed_ms = ticks_diff_fn(now_ms, state["last_update_ms"])
+    elapsed_s = min(max(elapsed_ms, 0), max_motion_ms) / 1000.0
+
+    previous_frequency = max(float(state.get("frequency_hz", 0.0)), 0.0)
+    previous_sign = state.get("motion_sign", state.get("direction", 0))
+    estimated_angle = float(state.get("estimated_angle_deg", 0.0))
+    if pulses_per_degree > 0.0:
+        estimated_angle += (
+            previous_sign * previous_frequency * elapsed_s /
+            pulses_per_degree)
+    estimated_angle = max(
+        -angle_limit_deg, min(angle_limit_deg, estimated_angle))
+
+    result = {
+        "zeroed": bool(zeroed),
+        "enabled": False,
+        "frequency_hz": 0.0,
+        "direction": 0,
+        "motion_sign": 0,
+        "estimated_angle_deg": estimated_angle,
+        "last_update_ms": now_ms,
+        "fault": "none",
+    }
+    if not zeroed:
+        result["fault"] = "not_zeroed"
+        return result
+    if not measurement_valid:
+        result["fault"] = "vision_invalid"
+        return result
+    if abs(error_cm) <= deadband_cm and abs(velocity_cm_s) < 0.05:
+        result["fault"] = "deadband"
+        return result
+
+    effort_hz = (kp_hz_per_cm * error_cm -
+                 kd_hz_per_cm_s * velocity_cm_s)
+    if abs(effort_hz) < 1.0:
+        result["fault"] = "deadband"
+        return result
+    logical_direction = 1 if effort_hz > 0.0 else -1
+    if ((estimated_angle >= angle_limit_deg and logical_direction > 0) or
+            (estimated_angle <= -angle_limit_deg and logical_direction < 0)):
+        result["fault"] = "angle_limit"
+        return result
+
+    target_frequency = max(
+        min(abs(effort_hz), max_frequency_hz), min_frequency_hz)
+    max_delta = frequency_ramp_hz_s * elapsed_s
+    if previous_sign != 0 and previous_sign != logical_direction:
+        next_frequency = max(0.0, previous_frequency - max_delta)
+        if next_frequency > 0.0:
+            logical_direction = previous_sign
+            result["fault"] = "reversing"
+        else:
+            result["fault"] = "reversing"
+            return result
+    elif target_frequency >= previous_frequency:
+        next_frequency = min(
+            target_frequency, previous_frequency + max_delta)
+        if previous_frequency <= 0.0 and next_frequency > 0.0:
+            next_frequency = max(next_frequency, min_frequency_hz)
+    else:
+        next_frequency = max(
+            target_frequency, previous_frequency - max_delta)
+    physical_direction = (-logical_direction if direction_invert
+                          else logical_direction)
+    result.update({
+        "enabled": next_frequency > 0.0,
+        "frequency_hz": next_frequency,
+        "direction": physical_direction,
+        "motion_sign": logical_direction,
+    })
+    return result
+
+
+class D36AStepper:
+    """Hardware-only D36A adapter; control decisions stay in pure code."""
+
+    def __init__(self, fpioa):
+        fpioa.set_function(STEPPER_STEP_IO, fpioa.PWM0, ie=0, oe=1)
+        fpioa.set_function(STEPPER_DIR_IO, fpioa.GPIO5, ie=0, oe=1)
+        fpioa.set_function(STEPPER_EN_IO, fpioa.GPIO6, ie=0, oe=1)
+        self.dir_pin = Pin(
+            STEPPER_DIR_IO, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
+        self.en_pin = Pin(
+            STEPPER_EN_IO, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
+        self.en_pin.value(0)
+        self.dir_pin.value(0)
+        self.pwm = PWM(
+            STEPPER_PWM_CHANNEL,
+            int(STEPPER_MIN_FREQUENCY_HZ), 50, enable=False)
+        self.running = False
+        self.last_frequency_hz = 0
+        self.last_direction = 0
+        self.watchdog = Timer(STEPPER_WATCHDOG_TIMER_ID)
+
+    def _watchdog_expired(self, timer):
+        self.stop(disable=True, cancel_watchdog=False)
+
+    def apply(self, command):
+        if not command.get("enabled", False):
+            disable = command.get("fault") in (
+                "not_zeroed", "vision_invalid")
+            self.stop(disable=disable)
+            return
+        frequency_hz = max(
+            int(round(command["frequency_hz"])),
+            int(STEPPER_MIN_FREQUENCY_HZ))
+        direction = 1 if command["direction"] > 0 else -1
+        if self.running and direction != self.last_direction:
+            self.pwm.duty(0)
+            self.pwm.enable(False)
+            self.running = False
+        self.dir_pin.value(1 if direction > 0 else 0)
+        if direction != self.last_direction:
+            time.sleep_us(5)
+            self.last_direction = direction
+        if frequency_hz != self.last_frequency_hz:
+            self.pwm.freq(frequency_hz)
+            self.last_frequency_hz = frequency_hz
+        self.en_pin.value(1)
+        if not self.running:
+            self.pwm.duty(50)
+            self.pwm.enable(True)
+            self.running = True
+        try:
+            self.watchdog.init(
+                mode=Timer.ONE_SHOT, period=STEPPER_VISION_TIMEOUT_MS,
+                callback=self._watchdog_expired)
+        except Exception:
+            self.stop(disable=True)
+            raise
+
+    def stop(self, disable=True, cancel_watchdog=True):
+        if cancel_watchdog:
+            try:
+                self.watchdog.deinit()
+            except Exception:
+                pass
+        try:
+            if self.running:
+                self.pwm.duty(0)
+                self.pwm.enable(False)
+        finally:
+            self.running = False
+            self.last_frequency_hz = 0
+            if disable:
+                self.en_pin.value(0)
+            else:
+                self.en_pin.value(1)
+
+    def deinit(self):
+        self.stop(disable=True)
+        self.pwm.deinit()
 
 
 def is_velocity_reversal(previous_vx, previous_vy, next_vx, next_vy):
@@ -1266,6 +1463,16 @@ def format_deviation_msg(dx, dy, valid):
     return msg.encode("utf-8")
 
 
+def format_stepper_msg(command):
+    return "M:{},R:{},F:{:04d},D:{:+d},A:{:+.2f},E:{}\n".format(
+        1 if command.get("zeroed", False) else 0,
+        1 if command.get("enabled", False) else 0,
+        int(round(command.get("frequency_hz", 0.0))),
+        int(command.get("direction", 0)),
+        float(command.get("estimated_angle_deg", 0.0)),
+        command.get("fault", "unknown")).encode("utf-8")
+
+
 # ============================================================
 # 坐标转换
 # ============================================================
@@ -1481,6 +1688,32 @@ def handle_touch_points(cal_state, points, now_ms, geometry=None):
     return new_calibration_state(None), False
 
 
+def handle_stepper_zero_touch(stepper_state, points, target_ready,
+                              target_was_ready, now_ms, release_event,
+                              zero_rect):
+    next_state = dict(stepper_state)
+    point = points[0] if points else None
+    inside_zero_rect = False
+    if point is not None:
+        x, y, width, height = zero_rect
+        inside_zero_rect = (
+            x <= point.x < x + width and y <= point.y < y + height)
+    if (next_state.get("zeroed", False) or not target_ready or
+            not target_was_ready or not inside_zero_rect or
+            getattr(point, "event", -1) != release_event):
+        return next_state
+    next_state.update({
+        "zeroed": True,
+        "frequency_hz": 0.0,
+        "direction": 0,
+        "motion_sign": 0,
+        "estimated_angle_deg": 0.0,
+        "last_update_ms": now_ms,
+        "fault": "vision_invalid",
+    })
+    return next_state
+
+
 # ============================================================
 # OSD绘制
 # ============================================================
@@ -1563,26 +1796,46 @@ def axis_measurement(current_control, cal_state):
     return measurement
 
 
-def update_servo_control(measurement):
-    # Hardware-specific servo configuration is intentionally left external.
-    return None
+def update_stepper_control(measurement, stepper, stepper_state,
+                           now_ms, control_timestamp_ms):
+    age_ms = time.ticks_diff(now_ms, control_timestamp_ms)
+    vision_fresh = (
+        measurement.get("valid", False) and
+        age_ms >= 0 and age_ms <= STEPPER_VISION_TIMEOUT_MS)
+    command = compute_stepper_command(
+        measurement.get("error_cm", 0.0),
+        measurement.get("velocity_cm_s", 0.0),
+        vision_fresh, stepper_state.get("zeroed", False),
+        now_ms, stepper_state,
+        STEPPER_KP_HZ_PER_CM, STEPPER_KD_HZ_PER_CM_S,
+        STEPPER_DEADBAND_CM, STEPPER_MIN_FREQUENCY_HZ,
+        STEPPER_MAX_FREQUENCY_HZ, STEPPER_FREQUENCY_RAMP_HZ_S,
+        STEPPER_PULSES_PER_ROD_DEG, STEPPER_ANGLE_LIMIT_DEG,
+        STEPPER_VISION_TIMEOUT_MS,
+        STEPPER_DIRECTION_INVERT, time.ticks_diff)
+    stepper.apply(command)
+    return command
 
 
-def publish_control_outputs(osd_img, capture, color_four, uart_obj, cal_state):
+def publish_control_outputs(osd_img, capture, color_four, uart_obj, cal_state,
+                            stepper, stepper_state):
     render_osd = should_render_osd(
         frame_counter + 1, OSD_EVERY_N_FRAMES)
     if render_osd:
         osd_img.clear()
     measurement = axis_measurement(control_state, cal_state)
-    update_servo_control(measurement)
+    stepper_state = update_stepper_control(
+        measurement, stepper, stepper_state,
+        time.ticks_ms(), control_state.get("timestamp_ms", 0))
     draw_osd(osd_img, capture, color_four, uart_obj,
-             cal_state, measurement, render_osd)
+             cal_state, measurement, stepper_state, render_osd)
     if render_osd:
         Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
+    return stepper_state
 
 
 def draw_osd(osd_img, capture, color_four, uart_obj,
-             cal_state, measurement, render_osd=True):
+             cal_state, measurement, stepper_state, render_osd=True):
     global frame_counter, tracker_state, current_deviation
     frame_counter += 1
 
@@ -1655,6 +1908,15 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
         if mode == CAL_WAIT_TARGET:
             osd_img.draw_string_advanced(
                 215, 20, 28, "Tap target point", color=C_CYAN_TEXT)
+        elif not stepper_state.get("zeroed", False):
+            zero_x, zero_y, zero_w, zero_h = STEPPER_ZERO_TOUCH_RECT
+            osd_img.draw_rectangle(
+                zero_x, zero_y, zero_w, zero_h,
+                color=C_CYAN_TEXT, thickness=4)
+            osd_img.draw_string_advanced(
+                zero_x + 32, zero_y + 34, 28,
+                "LEVEL ROD, TAP TO ZERO",
+                color=C_CYAN_TEXT)
         elif measurement["valid"]:
             ball_dx, ball_dy = ai_to_disp(
                 measurement["ball_point"][0], measurement["ball_point"][1])
@@ -1691,6 +1953,18 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
             osd_img.draw_string_advanced(
                 DISPLAY_WIDTH - 240, 88, 15,
                 "Hold 2s: new target", color=C_WHITE)
+            osd_img.draw_string_advanced(
+                DISPLAY_WIDTH - 240, 110, 17,
+                "F:{:04d}Hz D:{:+d}".format(
+                    int(round(stepper_state.get("frequency_hz", 0.0))),
+                    int(stepper_state.get("direction", 0))),
+                color=C_WHITE)
+            osd_img.draw_string_advanced(
+                DISPLAY_WIDTH - 240, 132, 17,
+                "A:{:+.2f} {}".format(
+                    stepper_state.get("estimated_angle_deg", 0.0),
+                    stepper_state.get("fault", "unknown")),
+                color=C_GREEN_TEXT if stepper_state.get("enabled") else C_WHITE)
 
     # ---- UART发送 ----
     if frame_counter % SEND_EVERY_N_FRAMES == 0:
@@ -1698,6 +1972,7 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
             current_deviation["dx"],
             current_deviation["dy"],
             current_deviation["valid"]))
+        uart_obj.write(format_stepper_msg(stepper_state))
 
     # ---- 调试打印 ----
     if frame_counter % PRINT_EVERY_N_FRAMES == 0:
@@ -1726,6 +2001,7 @@ def detection():
     global prediction_clamp_count
     print("=== Ball Position (new model) ===")
     wlan = None
+    stepper = None
     saved_calibration = load_axis_calibration()
     cal_state = new_calibration_state(saved_calibration)
 
@@ -1784,6 +2060,9 @@ def detection():
         time.sleep_ms(CAMERA_BOOT_DELAY_MS)
         sensor, osd_img, rtsp_server, blob_channel_available = (
             start_camera_with_blob_fallback(start_camera_pipeline))
+        stepper = D36AStepper(fpioa)
+        print("D36A ready: STEP=pin13 DIR=pin11 EN=pin12 (disabled)")
+        stepper_state = new_stepper_control_state(time.ticks_ms())
         tp = TOUCH(0)
         touch_poll_counter = 0
         if saved_calibration is None:
@@ -1820,10 +2099,20 @@ def detection():
             touch_poll_counter += 1
             if touch_poll_counter >= TOUCH_POLL_EVERY_N_FRAMES:
                 touch_points = tp.read(1)
+                target_was_ready = cal_state.get("mode") == CAL_READY
+                stepper_was_zeroed = stepper_state.get("zeroed", False)
                 cal_state, should_save_calibration = handle_touch_points(
                     cal_state, touch_points, time.ticks_ms(),
                     pipe_state.get("geometry") if pipe_state.get("valid")
                     else None)
+                stepper_state = handle_stepper_zero_touch(
+                    stepper_state, touch_points,
+                    cal_state.get("mode") == CAL_READY,
+                    target_was_ready, time.ticks_ms(),
+                    STEPPER_ZERO_TOUCH_EVENT, STEPPER_ZERO_TOUCH_RECT)
+                if (stepper_state.get("zeroed") and
+                        not stepper_was_zeroed):
+                    print("D36A zero accepted; automatic control armed")
                 if should_save_calibration:
                     if save_axis_calibration(
                             CALIBRATION_PATH, cal_state["calibration"]):
@@ -1886,8 +2175,9 @@ def detection():
                             predicted_frames = 0
                             # Blob control stays first on scheduled KPU
                             # validation frames and is published only once.
-                            publish_control_outputs(
-                                osd_img, None, color_four, uart, cal_state)
+                            stepper_state = publish_control_outputs(
+                                osd_img, None, color_four, uart, cal_state,
+                                stepper, stepper_state)
                         continue
 
                     capture = None
@@ -2024,8 +2314,9 @@ def detection():
                         else:
                             invalidate_control_state()
 
-                        publish_control_outputs(
-                            osd_img, capture, color_four, uart, cal_state)
+                        stepper_state = publish_control_outputs(
+                            osd_img, capture, color_four, uart, cal_state,
+                            stepper, stepper_state)
 
                     perf_frame_count += 1
                     if perf_frame_count >= PERF_EVERY_N_FRAMES:
@@ -2075,7 +2366,11 @@ def detection():
         raise
     finally:
         ai2d_output_tensor = None
-        cleanup_runtime_resources(rtsp_server, sensor, tensor_holder)
+        try:
+            if stepper is not None:
+                stepper.deinit()
+        finally:
+            cleanup_runtime_resources(rtsp_server, sensor, tensor_holder)
     return 0
 
 
