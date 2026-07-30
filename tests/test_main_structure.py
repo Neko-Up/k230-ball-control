@@ -41,6 +41,134 @@ def load_pure_function(name, namespace=None):
     return injected_namespace[name]
 
 
+CONTROL_BOUNDARY_NAMES = {
+    "publish_measurement", "update_servo_control",
+    "publish_control_outputs", "draw_osd", "format_deviation_msg",
+    "invalidate_control_state",
+}
+UART_OBJECT_NAMES = {"uart", "uart_obj"}
+
+
+def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
+    module_functions = {
+        item.name: item for item in tree.body if isinstance(item, ast.FunctionDef)
+    }
+    class_methods = {
+        item.name: {
+            method.name: method
+            for method in item.body
+            if isinstance(method, ast.FunctionDef)
+        }
+        for item in tree.body
+        if isinstance(item, ast.ClassDef)
+    }
+
+    def aliases_in(nodes, include_self_attributes=False):
+        aliases = {}
+        for node in nodes:
+            for assignment in (
+                    item for item in ast.walk(node)
+                    if isinstance(item, ast.Assign) and len(item.targets) == 1):
+                target = assignment.targets[0]
+                if isinstance(target, ast.Name):
+                    aliases[target.id] = assignment.value
+                elif (include_self_attributes
+                      and isinstance(target, ast.Attribute)
+                      and isinstance(target.value, ast.Name)
+                      and target.value.id == "self"):
+                    aliases[target.attr] = assignment.value
+        return aliases
+
+    module_aliases = aliases_in(tree.body)
+    class_aliases = {
+        class_name: aliases_in(methods.values(), True)
+        for class_name, methods in class_methods.items()
+    }
+
+    def class_name_for(expression, aliases, resolving=None):
+        if resolving is None:
+            resolving = set()
+        if isinstance(expression, ast.Name):
+            if expression.id in class_methods:
+                return expression.id
+            if expression.id in resolving or expression.id not in aliases:
+                return None
+            resolving.add(expression.id)
+            return class_name_for(aliases[expression.id], aliases, resolving)
+        return None
+
+    def resolve_callable(expression, aliases, class_name, resolving=None):
+        if resolving is None:
+            resolving = set()
+        if isinstance(expression, ast.Name):
+            if expression.id in resolving:
+                return set()
+            if expression.id in aliases:
+                resolving.add(expression.id)
+                return resolve_callable(
+                    aliases[expression.id], aliases, class_name, resolving)
+            if expression.id in module_functions:
+                return {("module", expression.id)}
+            return set()
+        if not isinstance(expression, ast.Attribute):
+            return set()
+        if (isinstance(expression.value, ast.Name)
+                and expression.value.id == "self"):
+            if expression.attr in resolving:
+                return set()
+            if expression.attr in aliases:
+                resolving.add(expression.attr)
+                return resolve_callable(
+                    aliases[expression.attr], aliases, class_name, resolving)
+            if expression.attr in class_methods.get(class_name, {}):
+                return {("class", class_name, expression.attr)}
+            return set()
+        target_class = class_name_for(expression.value, aliases)
+        if target_class is not None and expression.attr in class_methods[
+                target_class]:
+            return {("class", target_class, expression.attr)}
+        return set()
+
+    node_by_key = {
+        ("module", name): node for name, node in module_functions.items()
+    }
+    node_by_key.update({
+        ("class", class_name, method_name): node
+        for class_name, methods in class_methods.items()
+        for method_name, node in methods.items()
+    })
+    pending = [("class", worker_class_name, worker_method_name)]
+    visited = set()
+    control_calls = set()
+    while pending:
+        node_key = pending.pop()
+        if node_key in visited:
+            continue
+        visited.add(node_key)
+        node = node_by_key[node_key]
+        class_name = node_key[1] if node_key[0] == "class" else None
+        aliases = dict(module_aliases)
+        aliases.update(class_aliases.get(class_name, {}))
+        aliases.update(aliases_in([node]))
+        for call in (
+                item for item in ast.walk(node) if isinstance(item, ast.Call)):
+            if isinstance(call.func, ast.Name):
+                if call.func.id in CONTROL_BOUNDARY_NAMES:
+                    control_calls.add(call.func.id)
+            elif (isinstance(call.func, ast.Attribute)
+                  and call.func.attr == "write"
+                  and ((isinstance(call.func.value, ast.Name)
+                        and call.func.value.id in UART_OBJECT_NAMES)
+                       or (isinstance(call.func.value, ast.Attribute)
+                           and isinstance(call.func.value.value, ast.Name)
+                           and call.func.value.value.id == "self"
+                           and call.func.value.attr in UART_OBJECT_NAMES))):
+                control_calls.add("uart.write")
+            pending.extend(resolve_callable(
+                call.func, aliases, class_name))
+    return control_calls
+
+
 def test_detection_circle_geometry():
     detection_circle = load_pure_function("detection_circle")
     assert detection_circle(10, 20, 20, 12) == (20, 26, 13)
@@ -781,7 +909,6 @@ def test_rtsp_worker_isolated_from_control_outputs_and_startup_is_guarded():
         for item in rtsp_server.body
         if isinstance(item, ast.FunctionDef)
     }
-    stream_loop = methods["_stream_loop"]
     start = methods["start"]
 
     thread_calls = [
@@ -807,42 +934,50 @@ def test_rtsp_worker_isolated_from_control_outputs_and_startup_is_guarded():
     )
     assert guarded_thread_start
 
-    reachable = set()
-    pending = ["_stream_loop"]
-    while pending:
-        method_name = pending.pop()
-        if method_name in reachable:
-            continue
-        reachable.add(method_name)
-        for call in (
-                node for node in ast.walk(methods[method_name])
-                if isinstance(node, ast.Call)):
-            if (isinstance(call.func, ast.Attribute)
-                    and isinstance(call.func.value, ast.Name)
-                    and call.func.value.id == "self"
-                    and call.func.attr in methods):
-                pending.append(call.func.attr)
+    assert rtsp_worker_control_calls(
+        TREE, "LowLatencyRtspH264Server", "_stream_loop") == set()
 
-    assert {
-        "_stream_loop", "_encoder_send_frame", "_encoder_get_stream",
-        "_encoder_release_stream", "_send_pack",
-    } <= reachable
-    forbidden_names = {
-        "publish_measurement", "update_servo_control",
-        "publish_control_outputs", "draw_osd", "format_deviation_msg",
-        "invalidate_control_state",
-    }
-    forbidden_calls = []
-    for method_name in reachable:
-        for call in (
-                node for node in ast.walk(methods[method_name])
-                if isinstance(node, ast.Call)):
-            if isinstance(call.func, ast.Name):
-                forbidden_calls.append(call.func.id)
-            elif isinstance(call.func, ast.Attribute):
-                forbidden_calls.append(call.func.attr)
-    assert not forbidden_names.intersection(forbidden_calls)
-    assert "write" not in forbidden_calls
+
+def test_rtsp_call_graph_detects_module_alias_and_uart_wrappers():
+    tree = ast.parse(
+        """
+def publish_wrapper():
+    publish_measurement(1, 2, "blob", 3)
+
+def uart_wrapper(uart):
+    uart.write(b"X:+001,Y:+002\\n")
+
+callback = publish_wrapper
+
+class Worker:
+    def _measurement_helper(self):
+        callback()
+
+    def _uart_helper(self, uart):
+        uart_wrapper(uart)
+
+    def _stream_loop(self, uart):
+        self._measurement_helper()
+        Worker._uart_helper(self, uart)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {
+            "publish_measurement", "uart.write",
+        }
+
+
+def test_rtsp_call_graph_allows_network_writer():
+    tree = ast.parse(
+        """
+def send_packet(client):
+    client.write(b"video")
+
+class Worker:
+    def _stream_loop(self, client):
+        send_packet(client)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == set()
 
 
 def test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting():
@@ -1037,6 +1172,8 @@ if __name__ == "__main__":
     test_control_interface_and_model_paths_are_unchanged()
     test_rtsp_void_and_zero_returns_are_successful()
     test_rtsp_worker_isolated_from_control_outputs_and_startup_is_guarded()
+    test_rtsp_call_graph_detects_module_alias_and_uart_wrappers()
+    test_rtsp_call_graph_allows_network_writer()
     test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting()
     test_tracking_metrics_report_uses_exact_cadence_and_resets_window()
     test_tracking_metrics_report_guards_empty_averages_and_uses_ticks_diff()
