@@ -4,13 +4,18 @@ from pathlib import Path
 
 SOURCE = Path(__file__).parents[1] / "main.py"
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
-AI_BALL_LIMITS = {
+PURE_CONSTANTS = {
     target.id: ast.literal_eval(item.value)
     for item in TREE.body
     if isinstance(item, ast.Assign)
     for target in item.targets
     if isinstance(target, ast.Name)
-    and target.id in {"MIN_BOX_SIZE", "MAX_BOX_SIZE", "MAX_ASPECT_RATIO"}
+    and target.id in {
+        "MIN_BOX_SIZE", "MAX_BOX_SIZE", "MAX_ASPECT_RATIO",
+        "BLOB_THRESHOLDS",
+        "BLOB_MIN_PIXELS", "BLOB_MAX_PIXELS", "BLOB_MAX_ASPECT_RATIO",
+        "BLOB_MAX_CENTER_DISTANCE",
+    }
 }
 
 
@@ -25,7 +30,7 @@ def load_pure_function(name, namespace=None):
     )
     assert node is not None, "{} is missing".format(name)
     module = ast.Module(body=[node], type_ignores=[])
-    injected_namespace = dict(AI_BALL_LIMITS)
+    injected_namespace = dict(PURE_CONSTANTS)
     if namespace is not None:
         injected_namespace.update(namespace)
     exec(compile(module, str(SOURCE), "exec"), injected_namespace)
@@ -61,6 +66,121 @@ def test_single_ai_capture_rejects_invalid_configured_boxes():
         [0, 0.80, 0, 0, 40, 20],
     ]
     assert select_best_ai_ball(detections) is None
+
+
+def test_blob_candidate_prefers_nearest_valid_ball():
+    select_blob_candidate = load_pure_function("select_blob_candidate")
+    candidates = [
+        {"x": 90, "y": 180, "w": 20, "h": 18, "pixels": 240},
+        {"x": 200, "y": 180, "w": 22, "h": 20, "pixels": 300},
+        {"x": 105, "y": 180, "w": 80, "h": 5, "pixels": 300},
+    ]
+    result = select_blob_candidate(candidates, 100, 190)
+    assert result["x"] == 90
+
+
+def test_blob_detection_returns_plain_candidate_from_requested_roi():
+    select_blob_candidate = load_pure_function("select_blob_candidate")
+    detect_blob_measurement = load_pure_function(
+        "detect_blob_measurement",
+        {"select_blob_candidate": select_blob_candidate},
+    )
+
+    class Blob:
+        def rect(self):
+            return (90, 180, 20, 18)
+
+        def pixels(self):
+            return 240
+
+    class Image:
+        def __init__(self):
+            self.call = None
+
+        def find_blobs(self, thresholds, **kwargs):
+            self.call = (thresholds, kwargs)
+            return [Blob()]
+
+    img = Image()
+    roi = (20, 110, 192, 140)
+    result = detect_blob_measurement(img, roi)
+
+    assert result == {"x": 90, "y": 180, "w": 20, "h": 18, "pixels": 240}
+    assert img.call == (
+        [(0, 70, -20, 20, -20, 20)],
+        {
+            "roi": roi,
+            "pixels_threshold": 40,
+            "area_threshold": 40,
+            "merge": False,
+        },
+    )
+
+
+def test_blob_channel_is_best_effort_and_configured_before_media_init():
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    media_init = next(
+        call
+        for call in ast.walk(detection)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "MediaManager"
+        and call.func.attr == "init"
+    )
+    blob_try = next(
+        (
+            node
+            for node in ast.walk(detection)
+            if isinstance(node, ast.Try)
+            and any(
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "sensor"
+                and call.func.attr == "set_pixformat"
+                and call.args
+                and isinstance(call.args[0], ast.Attribute)
+                and isinstance(call.args[0].value, ast.Name)
+                and call.args[0].value.id == "Sensor"
+                and call.args[0].attr == "RGB565"
+                and any(
+                    keyword.arg == "chn"
+                    and isinstance(keyword.value, ast.Name)
+                    and keyword.value.id == "CAM_CHN_ID_1"
+                    for keyword in call.keywords
+                )
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+            )
+        ),
+        None,
+    )
+    assert blob_try is not None, "channel 1 RGB565 setup is missing"
+    calls = [call for call in ast.walk(blob_try) if isinstance(call, ast.Call)]
+    assert any(
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "sensor"
+        and call.func.attr == "set_framesize"
+        and any(
+            keyword.arg == "chn"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "CAM_CHN_ID_1"
+            for keyword in call.keywords
+        )
+        for call in calls
+    )
+    assert blob_try.lineno < media_init.lineno
+    assert any(
+        isinstance(value, ast.Constant)
+        and value.value == "Blob channel unavailable; KPU fallback active"
+        for handler in blob_try.handlers
+        for value in ast.walk(handler)
+    )
 
 
 def test_three_sample_velocity_and_bounded_prediction():
@@ -187,6 +307,9 @@ if __name__ == "__main__":
     test_detection_circle_geometry()
     test_single_ai_capture_selects_highest_valid_confidence()
     test_single_ai_capture_rejects_invalid_configured_boxes()
+    test_blob_candidate_prefers_nearest_valid_ball()
+    test_blob_detection_returns_plain_candidate_from_requested_roi()
+    test_blob_channel_is_best_effort_and_configured_before_media_init()
     test_three_sample_velocity_and_bounded_prediction()
     test_osd_updates_at_the_requested_cadence()
     test_control_ui_is_full_rate_and_rtc_is_removed()

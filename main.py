@@ -105,6 +105,13 @@ PREDICTION_HORIZON_MS     = 35
 PREDICTION_MIN_MS         = 20
 PREDICTION_MAX_MS         = 40
 PREDICTION_MAX_SHIFT_PX   = 16
+BLOB_THRESHOLDS           = [(0, 70, -20, 20, -20, 20)]
+BLOB_GLOBAL_ROI           = (0, 110, 640, 140)
+BLOB_ROI_HALF_WIDTH       = 96
+BLOB_MIN_PIXELS           = 40
+BLOB_MAX_PIXELS           = 1600
+BLOB_MAX_ASPECT_RATIO     = 1.8
+BLOB_MAX_CENTER_DISTANCE  = 80
 
 # ============================================================
 # 中值滤波
@@ -199,6 +206,51 @@ def invalidate_control_state():
         "x": 0, "y": 0, "vx": 0.0, "vy": 0.0,
         "valid": False, "source": "none", "timestamp_ms": 0,
     }
+
+
+def select_blob_candidate(candidates, expected_x, expected_y):
+    best_candidate = None
+    best_distance = None
+    for candidate in candidates:
+        width = candidate["w"]
+        height = candidate["h"]
+        pixels = candidate["pixels"]
+        if width <= 0 or height <= 0:
+            continue
+        if pixels < BLOB_MIN_PIXELS or pixels > BLOB_MAX_PIXELS:
+            continue
+        if max(width, height) / min(width, height) > BLOB_MAX_ASPECT_RATIO:
+            continue
+        center_x = candidate["x"] + width / 2
+        center_y = candidate["y"] + height / 2
+        distance = ((center_x - expected_x) ** 2 +
+                    (center_y - expected_y) ** 2) ** 0.5
+        if distance > BLOB_MAX_CENTER_DISTANCE:
+            continue
+        if best_distance is None or distance < best_distance:
+            best_candidate = candidate
+            best_distance = distance
+    return best_candidate
+
+
+def detect_blob_measurement(img, dynamic_roi):
+    blobs = img.find_blobs(
+        BLOB_THRESHOLDS,
+        roi=dynamic_roi,
+        pixels_threshold=BLOB_MIN_PIXELS,
+        area_threshold=BLOB_MIN_PIXELS,
+        merge=False)
+    candidates = []
+    for blob in blobs:
+        x, y, width, height = blob.rect()
+        candidates.append({
+            "x": x, "y": y, "w": width, "h": height,
+            "pixels": blob.pixels(),
+        })
+    expected_x = dynamic_roi[0] + dynamic_roi[2] / 2
+    expected_y = dynamic_roi[1] + dynamic_roi[3] / 2
+    return select_blob_candidate(candidates, expected_x, expected_y)
+
 
 def two_side_pad_param(input_size, output_size):
     ratio_w = output_size[0] / input_size[0]
@@ -1045,10 +1097,19 @@ def detection():
     sensor.set_vflip(False)
     sensor.set_framesize(width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT)
     sensor.set_pixformat(PIXEL_FORMAT_YUV_SEMIPLANAR_420)
-    # chn0 用于 LCD，chn2 用于 AI。
+    # chn0 用于 LCD，chn1 用于 Blob，chn2 用于 AI。
     sensor.set_framesize(width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
                          chn=CAM_CHN_ID_2)
     sensor.set_pixformat(PIXEL_FORMAT_RGB_888_PLANAR, chn=CAM_CHN_ID_2)
+    blob_channel_available = False
+    try:
+        sensor.set_framesize(
+            width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
+            chn=CAM_CHN_ID_1)
+        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
+        blob_channel_available = True
+    except BaseException:
+        print("Blob channel unavailable; KPU fallback active")
 
     # ---- 显示屏 ----
     sensor_bind_info = sensor.bind_info(x=0, y=0, chn=CAM_CHN_ID_0)
