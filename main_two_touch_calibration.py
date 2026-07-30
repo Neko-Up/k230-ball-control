@@ -1788,6 +1788,10 @@ def draw_dynamic_pipe(osd_img, geometry, color):
 
 def axis_measurement(current_control, cal_state):
     calibration = cal_state.get("calibration")
+    target_position_cm = 0.0
+    if cal_state.get("mode") == CAL_READY and calibration is not None:
+        target_position_cm = (
+            float(calibration.get("target_param", 0.5)) - 0.5) * PIPE_LENGTH_CM
     if (cal_state.get("mode") != CAL_READY or
             calibration is None or not current_control["valid"] or
             not pipe_state.get("valid") or
@@ -1796,7 +1800,7 @@ def axis_measurement(current_control, cal_state):
             "valid": False,
             "position_cm": 0.0,
             "ball_position_cm": 0.0,
-            "target_position_cm": 0.0,
+            "target_position_cm": target_position_cm,
             "error_cm": 0.0,
             "velocity_cm_s": 0.0,
             "lateral_px": 0.0,
@@ -1927,6 +1931,12 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
             osd_img.draw_string_advanced(
                 250, 20, 26, "Green pipe not found", color=C_RED)
 
+        if mode == CAL_READY:
+            osd_img.draw_string_advanced(
+                DISPLAY_WIDTH - 240, 62, 20,
+                "T:{:+.2f}cm".format(measurement["target_position_cm"]),
+                color=C_WHITE)
+
         if mode == CAL_WAIT_TARGET:
             osd_img.draw_string_advanced(
                 215, 20, 28, "Tap target point", color=C_CYAN_TEXT)
@@ -1960,10 +1970,6 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
                 "|O-B|:{:.2f}cm".format(
                     abs(measurement["ball_position_cm"])),
                 color=C_GREEN_TEXT)
-            osd_img.draw_string_advanced(
-                DISPLAY_WIDTH - 240, 62, 20,
-                "T:{:+.2f}cm".format(measurement["target_position_cm"]),
-                color=C_WHITE)
             osd_img.draw_string_advanced(
                 DISPLAY_WIDTH - 240, 88, 22,
                 "E:{:+.2f}cm".format(measurement["error_cm"]),

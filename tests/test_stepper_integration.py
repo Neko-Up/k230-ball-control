@@ -110,6 +110,18 @@ def test_lcd_exposes_estimated_and_target_rod_angles():
     assert "A:{:+.2f}/{:+.2f}" in ast.unparse(draw)
 
 
+def test_target_position_is_drawn_outside_measurement_valid_branch():
+    draw = next(
+        node for node in TREE.body
+        if isinstance(node, ast.FunctionDef) and node.name == "draw_osd"
+    )
+    source = ast.unparse(draw)
+    target_label = source.find("T:{:+.2f}cm")
+    measurement_branch = source.find("elif measurement['valid']")
+    assert target_label >= 0
+    assert target_label < measurement_branch
+
+
 def test_axis_distance_is_drawn_before_zero_prompt_overlay():
     draw = next(
         node for node in TREE.body
