@@ -55,12 +55,27 @@ def test_d36a_adapter_owns_pwm_direction_and_active_high_enable():
     assert "self.pwm.duty(50)" in apply_text
     assert "self.watchdog.init" in apply_text
     assert "except Exception" in apply_text
-    assert "self.stop(disable=True)" in apply_text
+    assert "self.stop(disable=True, cancel_watchdog=False)" in apply_text
     stop_text = ast.unparse(methods["stop"])
     assert ".enable(" not in stop_text
     assert "self.pwm.duty(0)" in stop_text
     assert "self.en_pin.value(0)" in stop_text
     assert "self.en_pin.value(1)" in stop_text
+
+
+def test_stepper_watchdog_is_recreated_only_after_an_armed_timer_is_cancelled():
+    cls = next(
+        node for node in TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "D36AStepper"
+    )
+    methods = {
+        node.name: ast.unparse(node)
+        for node in cls.body if isinstance(node, ast.FunctionDef)
+    }
+    assert "self.watchdog_armed = False" in methods["__init__"]
+    assert "self.watchdog_armed = True" in methods["apply"]
+    assert "if cancel_watchdog and self.watchdog_armed" in methods["stop"]
+    assert "self.watchdog = Timer(STEPPER_WATCHDOG_TIMER_ID)" in methods["stop"]
 
 
 def test_detection_cleanup_deinitializes_stepper_before_media_cleanup():

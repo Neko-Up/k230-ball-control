@@ -345,8 +345,10 @@ class D36AStepper:
         self.last_frequency_hz = 0
         self.last_direction = 0
         self.watchdog = Timer(STEPPER_WATCHDOG_TIMER_ID)
+        self.watchdog_armed = False
 
     def _watchdog_expired(self, timer):
+        self.watchdog_armed = False
         self.stop(disable=True, cancel_watchdog=False)
 
     def apply(self, command):
@@ -377,16 +379,21 @@ class D36AStepper:
             self.watchdog.init(
                 mode=Timer.ONE_SHOT, period=STEPPER_VISION_TIMEOUT_MS,
                 callback=self._watchdog_expired)
+            self.watchdog_armed = True
         except Exception:
-            self.stop(disable=True)
+            self.watchdog_armed = False
+            self.stop(disable=True, cancel_watchdog=False)
             raise
 
     def stop(self, disable=True, cancel_watchdog=True):
-        if cancel_watchdog:
+        if cancel_watchdog and self.watchdog_armed:
             try:
                 self.watchdog.deinit()
-            except Exception:
-                pass
+            finally:
+                # CanMV Timer objects cannot be initialized again after
+                # deinit(); create a fresh software timer for the next move.
+                self.watchdog = Timer(STEPPER_WATCHDOG_TIMER_ID)
+                self.watchdog_armed = False
         try:
             if self.running:
                 self.pwm.duty(0)
