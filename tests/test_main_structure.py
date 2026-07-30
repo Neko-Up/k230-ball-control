@@ -52,7 +52,8 @@ UART_OBJECT_NAMES = {"uart", "uart_obj"}
 def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
     module_functions = {
         item.name: item
-        for item in tree.body if isinstance(item, ast.FunctionDef)
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef)
     }
     class_methods = {
         item.name: {
@@ -63,42 +64,9 @@ def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
         for item in tree.body
         if isinstance(item, ast.ClassDef)
     }
-
-    def scope_nodes(statements):
-        for statement in statements:
-            if isinstance(statement, (ast.FunctionDef, ast.ClassDef,
-                                      ast.Lambda)):
-                continue
-            yield statement
-            for child in ast.iter_child_nodes(statement):
-                if isinstance(child, ast.stmt):
-                    yield from scope_nodes([child])
-
-    def aliases_in(statements, include_self_attributes=False):
-        aliases = {}
-        for node in scope_nodes(statements):
-            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-                continue
-            target = node.targets[0]
-            if isinstance(target, ast.Name):
-                aliases[target.id] = node.value
-            elif (include_self_attributes
-                  and isinstance(target, ast.Attribute)
-                  and isinstance(target.value, ast.Name)
-                  and target.value.id == "self"):
-                aliases[target.attr] = node.value
-        return aliases
-
-    module_aliases = aliases_in(tree.body)
-    class_aliases = {
-        class_name: aliases_in(
-            [statement for method in methods.values()
-             for statement in method.body], True)
-        for class_name, methods in class_methods.items()
-    }
-
     node_by_key = {
-        ("module", name): node for name, node in module_functions.items()
+        ("module", name): node
+        for name, node in module_functions.items()
     }
     node_by_key.update({
         ("class", class_name, method_name): node
@@ -106,152 +74,601 @@ def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
         for method_name, node in methods.items()
     })
 
-    def function_params(node):
-        return [argument.arg for argument in node.args.args]
+    uart_value = ("uart-value",)
+    worker_instance_value = ("worker-instance",)
+    foreign_instance_value = ("foreign-instance",)
+    local_class_names = {}
+    local_defining_scopes = {}
+    environment_scopes = {}
+    control_calls = set()
 
-    def local_functions(node):
+    def copy_bindings(bindings):
         return {
-            statement.name: statement
-            for statement in node.body if isinstance(statement, ast.FunctionDef)
+            name: set(values)
+            for name, values in bindings.items()
         }
 
-    def local_key(node):
-        key = ("local", id(node))
-        node_by_key[key] = node
-        return key
+    def merge_bindings(bindings_list):
+        merged = {}
+        for bindings in bindings_list:
+            for name, values in bindings.items():
+                merged.setdefault(name, set()).update(values)
+        return merged
 
-    def class_name_for(expression, aliases, resolving=None):
-        if resolving is None:
-            resolving = set()
-        if isinstance(expression, ast.Name):
-            if expression.id in class_methods:
-                return expression.id
-            if expression.id in resolving or expression.id not in aliases:
-                return None
-            resolving.add(expression.id)
-            return class_name_for(aliases[expression.id], aliases, resolving)
-        return None
+    def replace_bindings(destination, source):
+        destination.clear()
+        destination.update(copy_bindings(source))
 
-    def resolve_callable(expression, aliases, class_name, functions,
-                         resolving=None):
-        if resolving is None:
-            resolving = set()
+    def new_environment_scope(environment, instance_state):
+        scope = {
+            "environment": environment,
+            "instance_state": instance_state,
+        }
+        environment_scopes[id(environment)] = scope
+        return scope
+
+    def copy_environment(environment):
+        copied = copy_bindings(environment)
+        scope = environment_scopes.get(id(environment))
+        if scope is not None:
+            environment_scopes[id(copied)] = scope
+        return copied
+
+    def positional_parameter_names(node):
+        return [
+            argument.arg
+            for argument in node.args.posonlyargs + node.args.args
+        ]
+
+    def all_parameter_names(node):
+        names = positional_parameter_names(node)
+        names.extend(argument.arg for argument in node.args.kwonlyargs)
+        if node.args.vararg is not None:
+            names.append(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            names.append(node.args.kwarg.arg)
+        return names
+
+    def expression_values(expression, environment, instance_state,
+                          class_name):
         if isinstance(expression, ast.Name):
+            if expression.id in environment:
+                return set(environment[expression.id])
             if expression.id in CONTROL_BOUNDARY_NAMES:
                 return {("boundary", expression.id)}
-            if expression.id in resolving:
-                return set()
-            if expression.id in aliases:
-                resolving.add(expression.id)
-                return resolve_callable(
-                    aliases[expression.id], aliases, class_name, functions,
-                    resolving)
-            if expression.id in functions:
-                return {local_key(functions[expression.id])}
-            if expression.id in module_functions:
-                return {("module", expression.id)}
+            if expression.id in UART_OBJECT_NAMES:
+                return {uart_value}
             return set()
         if not isinstance(expression, ast.Attribute):
             return set()
         if (isinstance(expression.value, ast.Name)
                 and expression.value.id == "self"):
-            if expression.attr in resolving:
-                return set()
-            if expression.attr in aliases:
-                resolving.add(expression.attr)
-                return resolve_callable(
-                    aliases[expression.attr], aliases, class_name, functions,
-                    resolving)
+            if expression.attr in instance_state:
+                return set(instance_state[expression.attr])
+            if (expression.attr in UART_OBJECT_NAMES
+                    and worker_instance_value in environment.get(
+                        "self", set())):
+                return {uart_value}
             if expression.attr in class_methods.get(class_name, {}):
-                return {("class", class_name, expression.attr)}
+                return {
+                    (
+                        "bound-method", class_name, expression.attr,
+                        worker_instance_value in environment.get(
+                            "self", set()),
+                    )
+                }
             return set()
-        target_class = class_name_for(expression.value, aliases)
-        if target_class is not None and expression.attr in class_methods[
-                target_class]:
-            return {("class", target_class, expression.attr)}
-        return set()
 
-    def expression_is_uart(expression, aliases, uart_names, resolving=None):
-        if resolving is None:
-            resolving = set()
-        if isinstance(expression, ast.Name):
-            if expression.id in uart_names or expression.id in UART_OBJECT_NAMES:
-                return True
-            if expression.id in resolving or expression.id not in aliases:
-                return False
-            resolving.add(expression.id)
-            return expression_is_uart(
-                aliases[expression.id], aliases, uart_names, resolving)
+        values = set()
+        for owner in expression_values(
+                expression.value, environment, instance_state, class_name):
+            if (owner[0] == "class"
+                    and expression.attr in class_methods.get(owner[1], {})):
+                values.add(
+                    ("unbound-method", owner[1], expression.attr))
+        return values
+
+    def bind_assignment_target(target, values, environment,
+                               instance_state):
+        if isinstance(target, ast.Name):
+            environment[target.id] = set(values)
+            return
+        if (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"):
+            instance_state[target.attr] = set(values)
+            return
+        if isinstance(target, (ast.List, ast.Tuple)):
+            for element in target.elts:
+                bind_assignment_target(
+                    element, set(), environment, instance_state)
+        elif isinstance(target, ast.Starred):
+            bind_assignment_target(
+                target.value, set(), environment, instance_state)
+
+    def is_uart_constructor(expression):
+        if not isinstance(expression, ast.Call):
+            return False
         return (
-            isinstance(expression, ast.Attribute)
-            and isinstance(expression.value, ast.Name)
-            and expression.value.id == "self"
-            and expression.attr in UART_OBJECT_NAMES)
+            isinstance(expression.func, ast.Name)
+            and expression.func.id == "UART"
+        ) or (
+            isinstance(expression.func, ast.Attribute)
+            and expression.func.attr == "UART"
+        )
 
-    def lexical_calls(statements):
-        def walk(node):
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Lambda)):
-                return
-            if isinstance(node, ast.Call):
-                yield node
-            for child in ast.iter_child_nodes(node):
-                yield from walk(child)
+    def register_local_function(node, environment, class_name):
+        key = ("local", id(node))
+        node_by_key[key] = node
+        local_class_names[key] = class_name
+        local_defining_scopes[key] = environment_scopes[id(environment)]
+        environment[node.name] = {key}
 
+    def analyze_expression(expression, environment, instance_state,
+                           class_name, active):
+        if expression is None or isinstance(expression, ast.Lambda):
+            return
+        if isinstance(expression, ast.Call):
+            analyze_expression(
+                expression.func, environment, instance_state,
+                class_name, active)
+            targets = expression_values(
+                expression.func, environment, instance_state, class_name)
+            write_is_uart = (
+                isinstance(expression.func, ast.Attribute)
+                and expression.func.attr == "write"
+                and uart_value in expression_values(
+                    expression.func.value, environment,
+                    instance_state, class_name)
+            )
+
+            positional_values = []
+            for argument in expression.args:
+                analyze_expression(
+                    argument, environment, instance_state,
+                    class_name, active)
+                positional_values.append(expression_values(
+                    argument, environment, instance_state, class_name))
+
+            keyword_values = []
+            for keyword in expression.keywords:
+                analyze_expression(
+                    keyword.value, environment, instance_state,
+                    class_name, active)
+                keyword_values.append((
+                    keyword.arg,
+                    expression_values(
+                        keyword.value, environment,
+                        instance_state, class_name),
+                ))
+
+            process_call(
+                targets, positional_values, keyword_values,
+                write_is_uart, environment, instance_state,
+                class_name, active)
+            return
+        if isinstance(expression, ast.NamedExpr):
+            analyze_expression(
+                expression.value, environment, instance_state,
+                class_name, active)
+            bind_assignment_target(
+                expression.target,
+                expression_values(
+                    expression.value, environment,
+                    instance_state, class_name),
+                environment, instance_state)
+            return
+        for child in ast.iter_child_nodes(expression):
+            if isinstance(child, ast.expr):
+                analyze_expression(
+                    child, environment, instance_state,
+                    class_name, active)
+
+    def analyze_branches(branches, environment, instance_state,
+                         class_name, active):
+        environment_results = []
+        instance_results = []
+        for statements, initial_environment, initial_instance in branches:
+            branch_environment = copy_environment(initial_environment)
+            branch_instance = copy_bindings(initial_instance)
+            analyze_statements(
+                statements, branch_environment, branch_instance,
+                class_name, active)
+            environment_results.append(branch_environment)
+            instance_results.append(branch_instance)
+        replace_bindings(
+            environment, merge_bindings(environment_results))
+        replace_bindings(
+            instance_state, merge_bindings(instance_results))
+
+    def analyze_statements(statements, environment, instance_state,
+                           class_name, active):
         for statement in statements:
-            yield from walk(statement)
+            if isinstance(statement, ast.FunctionDef):
+                for decorator in statement.decorator_list:
+                    analyze_expression(
+                        decorator, environment, instance_state,
+                        class_name, active)
+                for default in (
+                        list(statement.args.defaults)
+                        + [value for value in statement.args.kw_defaults
+                           if value is not None]):
+                    analyze_expression(
+                        default, environment, instance_state,
+                        class_name, active)
+                register_local_function(
+                    statement, environment, class_name)
+                continue
+            if isinstance(statement, (ast.ClassDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(statement, ast.Assign):
+                analyze_expression(
+                    statement.value, environment, instance_state,
+                    class_name, active)
+                values = expression_values(
+                    statement.value, environment,
+                    instance_state, class_name)
+                for target in statement.targets:
+                    bind_assignment_target(
+                        target, values, environment, instance_state)
+                continue
+            if isinstance(statement, ast.AnnAssign):
+                analyze_expression(
+                    statement.value, environment, instance_state,
+                    class_name, active)
+                bind_assignment_target(
+                    statement.target,
+                    expression_values(
+                        statement.value, environment,
+                        instance_state, class_name),
+                    environment, instance_state)
+                continue
+            if isinstance(statement, ast.AugAssign):
+                analyze_expression(
+                    statement.target, environment, instance_state,
+                    class_name, active)
+                analyze_expression(
+                    statement.value, environment, instance_state,
+                    class_name, active)
+                bind_assignment_target(
+                    statement.target, set(),
+                    environment, instance_state)
+                continue
+            if isinstance(statement, ast.If):
+                analyze_expression(
+                    statement.test, environment, instance_state,
+                    class_name, active)
+                base_environment = copy_environment(environment)
+                base_instance = copy_bindings(instance_state)
+                analyze_branches(
+                    [
+                        (statement.body, base_environment, base_instance),
+                        (statement.orelse, base_environment, base_instance),
+                    ],
+                    environment, instance_state, class_name, active)
+                continue
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                analyze_expression(
+                    statement.iter, environment, instance_state,
+                    class_name, active)
+                base_environment = copy_environment(environment)
+                base_instance = copy_bindings(instance_state)
+                body_environment = copy_environment(base_environment)
+                body_instance = copy_bindings(base_instance)
+                bind_assignment_target(
+                    statement.target, set(),
+                    body_environment, body_instance)
+                analyze_statements(
+                    statement.body, body_environment, body_instance,
+                    class_name, active)
+                replace_bindings(
+                    environment,
+                    merge_bindings([base_environment, body_environment]))
+                replace_bindings(
+                    instance_state,
+                    merge_bindings([base_instance, body_instance]))
+                analyze_statements(
+                    statement.orelse, environment, instance_state,
+                    class_name, active)
+                continue
+            if isinstance(statement, ast.While):
+                analyze_expression(
+                    statement.test, environment, instance_state,
+                    class_name, active)
+                base_environment = copy_environment(environment)
+                base_instance = copy_bindings(instance_state)
+                body_environment = copy_environment(base_environment)
+                body_instance = copy_bindings(base_instance)
+                analyze_statements(
+                    statement.body, body_environment, body_instance,
+                    class_name, active)
+                replace_bindings(
+                    environment,
+                    merge_bindings([base_environment, body_environment]))
+                replace_bindings(
+                    instance_state,
+                    merge_bindings([base_instance, body_instance]))
+                analyze_statements(
+                    statement.orelse, environment, instance_state,
+                    class_name, active)
+                continue
+            if isinstance(statement, (ast.Try, ast.TryStar)):
+                base_environment = copy_environment(environment)
+                base_instance = copy_bindings(instance_state)
 
-    def passed_uart_names(call, callee, aliases, caller_uart_names):
-        parameter_names = function_params(callee)
-        uart_names = set(UART_OBJECT_NAMES).intersection(parameter_names)
-        for index, value in enumerate(call.args):
-            if (index < len(parameter_names)
-                    and expression_is_uart(
-                        value, aliases, caller_uart_names)):
-                uart_names.add(parameter_names[index])
-        for keyword in call.keywords:
-            if (keyword.arg in parameter_names
-                    and expression_is_uart(
-                        keyword.value, aliases, caller_uart_names)):
-                uart_names.add(keyword.arg)
-        return uart_names
+                normal_environment = copy_environment(base_environment)
+                normal_instance = copy_bindings(base_instance)
+                analyze_statements(
+                    statement.body, normal_environment, normal_instance,
+                    class_name, active)
+                analyze_statements(
+                    statement.orelse, normal_environment, normal_instance,
+                    class_name, active)
 
-    pending = [(("class", worker_class_name, worker_method_name),
-                frozenset(UART_OBJECT_NAMES))]
-    visited = set()
-    control_calls = set()
-    while pending:
-        node_key, uart_names = pending.pop()
-        visit_key = (node_key, uart_names)
-        if visit_key in visited:
-            continue
-        visited.add(visit_key)
+                branch_environments = [normal_environment]
+                branch_instances = [normal_instance]
+                for handler in statement.handlers:
+                    handler_environment = copy_environment(base_environment)
+                    handler_instance = copy_bindings(base_instance)
+                    analyze_expression(
+                        handler.type, handler_environment,
+                        handler_instance, class_name, active)
+                    if handler.name is not None:
+                        handler_environment[handler.name] = set()
+                    analyze_statements(
+                        handler.body, handler_environment,
+                        handler_instance, class_name, active)
+                    branch_environments.append(handler_environment)
+                    branch_instances.append(handler_instance)
+
+                replace_bindings(
+                    environment, merge_bindings(branch_environments))
+                replace_bindings(
+                    instance_state, merge_bindings(branch_instances))
+                analyze_statements(
+                    statement.finalbody, environment, instance_state,
+                    class_name, active)
+                continue
+            if isinstance(statement, (ast.With, ast.AsyncWith)):
+                for item in statement.items:
+                    analyze_expression(
+                        item.context_expr, environment, instance_state,
+                        class_name, active)
+                    if item.optional_vars is not None:
+                        bind_assignment_target(
+                            item.optional_vars, set(),
+                            environment, instance_state)
+                analyze_statements(
+                    statement.body, environment, instance_state,
+                    class_name, active)
+                continue
+            if isinstance(statement, ast.Match):
+                analyze_expression(
+                    statement.subject, environment, instance_state,
+                    class_name, active)
+                base_environment = copy_environment(environment)
+                base_instance = copy_bindings(instance_state)
+                branches = [
+                    (case.body, base_environment, base_instance)
+                    for case in statement.cases
+                ]
+                branches.append(
+                    ([], base_environment, base_instance))
+                analyze_branches(
+                    branches, environment, instance_state,
+                    class_name, active)
+                continue
+
+            for child in ast.iter_child_nodes(statement):
+                if isinstance(child, ast.expr):
+                    analyze_expression(
+                        child, environment, instance_state,
+                        class_name, active)
+                elif isinstance(child, ast.stmt):
+                    analyze_statements(
+                        [child], environment, instance_state,
+                        class_name, active)
+
+    def analyze_callable(target, positional_values, keyword_values,
+                         caller_environment, caller_instance, active):
+        kind = target[0]
+        if kind == "module":
+            node_key = target
+            class_name = None
+            bound_method = False
+            uses_worker_instance = False
+            uses_current_instance = False
+            base_environment = module_environment
+            source_instance = caller_instance
+        elif kind == "local":
+            node_key = target
+            class_name = local_class_names.get(target)
+            bound_method = False
+            defining_scope = local_defining_scopes[target]
+            caller_scope = environment_scopes[id(caller_environment)]
+            same_defining_scope = caller_scope is defining_scope
+            base_environment = (
+                caller_environment
+                if same_defining_scope
+                else defining_scope["environment"]
+            )
+            source_instance = (
+                caller_instance
+                if same_defining_scope
+                else defining_scope["instance_state"]
+            )
+            uses_worker_instance = (
+                worker_instance_value in base_environment.get(
+                    "self", set())
+            )
+            uses_current_instance = (
+                uses_worker_instance
+                or foreign_instance_value in base_environment.get(
+                    "self", set())
+            )
+        elif kind in {"bound-method", "unbound-method"}:
+            node_key = ("class", target[1], target[2])
+            class_name = target[1]
+            bound_method = kind == "bound-method"
+            receiver_values = (
+                set() if bound_method or not positional_values
+                else positional_values[0]
+            )
+            uses_worker_instance = (
+                target[3] if bound_method
+                else worker_instance_value in receiver_values
+            )
+            uses_current_instance = (
+                bound_method
+                or uses_worker_instance
+                or foreign_instance_value in receiver_values
+            )
+            base_environment = module_environment
+            source_instance = caller_instance
+        else:
+            return copy_bindings(caller_instance)
+
+        if node_key in active:
+            return copy_bindings(caller_instance)
+
         node = node_by_key[node_key]
-        class_name = node_key[1] if node_key[0] == "class" else None
-        aliases = dict(module_aliases)
-        aliases.update(class_aliases.get(class_name, {}))
-        aliases.update(aliases_in(node.body))
-        functions = local_functions(node)
-        for call in lexical_calls(node.body):
-            if isinstance(call.func, ast.Name):
-                if call.func.id in CONTROL_BOUNDARY_NAMES:
-                    control_calls.add(call.func.id)
-            elif (isinstance(call.func, ast.Attribute)
-                  and call.func.attr == "write"
-                  and expression_is_uart(
-                      call.func.value, aliases, uart_names)):
-                control_calls.add("uart.write")
-            for target in resolve_callable(
-                    call.func, aliases, class_name, functions):
-                if target[0] == "boundary":
-                    control_calls.add(target[1])
-                    continue
-                pending.append((
-                    target,
-                    frozenset(passed_uart_names(
-                        call, node_by_key[target], aliases, uart_names))))
+        callee_environment = copy_bindings(base_environment)
+        for name in all_parameter_names(node):
+            callee_environment[name] = set()
+
+        positional_names = positional_parameter_names(node)
+        if bound_method and positional_names:
+            positional_names = positional_names[1:]
+        for index, values in enumerate(positional_values):
+            if index < len(positional_names):
+                callee_environment[positional_names[index]] = set(values)
+
+        ignored_bound_name = None
+        full_positional_names = positional_parameter_names(node)
+        if full_positional_names and kind in {
+                "bound-method", "unbound-method"}:
+            receiver_name = full_positional_names[0]
+            if bound_method:
+                ignored_bound_name = receiver_name
+            if uses_worker_instance:
+                callee_environment[receiver_name] = {
+                    worker_instance_value,
+                }
+            else:
+                callee_environment[receiver_name] = {
+                    foreign_instance_value,
+                }
+        for name, values in keyword_values:
+            if (name is not None
+                    and name in callee_environment
+                    and name != ignored_bound_name):
+                callee_environment[name] = set(values)
+
+        callee_instance = (
+            copy_bindings(source_instance)
+            if uses_current_instance else {}
+        )
+        new_environment_scope(callee_environment, callee_instance)
+        active.add(node_key)
+        try:
+            analyze_statements(
+                node.body, callee_environment, callee_instance,
+                class_name, active)
+        finally:
+            active.remove(node_key)
+        if uses_current_instance:
+            return callee_instance
+        return copy_bindings(caller_instance)
+
+    def process_call(targets, positional_values, keyword_values,
+                     write_is_uart, environment, instance_state,
+                     class_name, active):
+        if write_is_uart:
+            control_calls.add("uart.write")
+
+        resulting_instances = []
+        for target in targets:
+            if target[0] == "boundary":
+                control_calls.add(target[1])
+                resulting_instances.append(
+                    copy_bindings(instance_state))
+            elif target[0] in {
+                    "module", "local",
+                    "bound-method", "unbound-method"}:
+                resulting_instances.append(analyze_callable(
+                    target, positional_values, keyword_values,
+                    environment, instance_state, active))
+            else:
+                resulting_instances.append(
+                    copy_bindings(instance_state))
+        if resulting_instances:
+            replace_bindings(
+                instance_state,
+                merge_bindings(resulting_instances))
+
+    module_environment = {}
+    module_instance_state = {}
+    new_environment_scope(module_environment, module_instance_state)
+    for statement in tree.body:
+        if isinstance(statement, ast.FunctionDef):
+            if statement.name in CONTROL_BOUNDARY_NAMES:
+                module_environment[statement.name] = {
+                    ("boundary", statement.name)
+                }
+            else:
+                module_environment[statement.name] = {
+                    ("module", statement.name)
+                }
+        elif isinstance(statement, ast.ClassDef):
+            module_environment[statement.name] = {
+                ("class", statement.name)
+            }
+        elif isinstance(statement, ast.Assign):
+            values = expression_values(
+                statement.value, module_environment,
+                module_instance_state, None)
+            for target in statement.targets:
+                target_values = values
+                if (isinstance(target, ast.Name)
+                        and target.id in UART_OBJECT_NAMES
+                        and is_uart_constructor(statement.value)):
+                    target_values = {uart_value}
+                bind_assignment_target(
+                    target, target_values, module_environment,
+                    module_instance_state)
+        elif isinstance(statement, ast.AnnAssign):
+            values = expression_values(
+                statement.value, module_environment,
+                module_instance_state, None)
+            if (isinstance(statement.target, ast.Name)
+                    and statement.target.id in UART_OBJECT_NAMES
+                    and is_uart_constructor(statement.value)):
+                values = {uart_value}
+            bind_assignment_target(
+                statement.target, values,
+                module_environment, module_instance_state)
+
+    root_key = ("class", worker_class_name, worker_method_name)
+    root = node_by_key[root_key]
+    root_environment = copy_bindings(module_environment)
+    for name in all_parameter_names(root):
+        root_environment[name] = (
+            {uart_value} if name in UART_OBJECT_NAMES else set()
+        )
+    root_instance_state = {
+        name: {uart_value}
+        for name in UART_OBJECT_NAMES
+    }
+    new_environment_scope(root_environment, root_instance_state)
+    root_positional_names = positional_parameter_names(root)
+    if root_positional_names:
+        root_environment[root_positional_names[0]] = {
+            worker_instance_value,
+        }
+    analyze_statements(
+        root.body, root_environment, root_instance_state,
+        worker_class_name, {root_key})
     return control_calls
-
-
 def test_detection_circle_geometry():
     detection_circle = load_pure_function("detection_circle")
     assert detection_circle(10, 20, 20, 12) == (20, 26, 13)
@@ -1142,6 +1559,274 @@ class Worker:
         called_tree, "Worker", "_stream_loop") == {"publish_measurement"}
 
 
+def test_rtsp_call_graph_resolves_aliases_at_each_call_site():
+    tree = ast.parse(
+        """
+def send_packet():
+    return None
+
+class Worker:
+    def _stream_loop(self):
+        callback = publish_measurement
+        callback()
+        callback = send_packet
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"publish_measurement"}
+
+
+def test_rtsp_call_graph_maps_bound_method_arguments_after_self():
+    tree = ast.parse(
+        """
+class Worker:
+    def helper(self, port):
+        port.write(b"X:+001,Y:+002\\n")
+
+    def _stream_loop(self, uart):
+        self.helper(uart)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"uart.write"}
+
+
+def test_rtsp_call_graph_ignores_self_aliases_from_uncalled_methods():
+    tree = ast.parse(
+        """
+class Worker:
+    def unused(self):
+        self.callback = publish_measurement
+
+    def _stream_loop(self):
+        self.callback()
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == set()
+
+
+def test_rtsp_call_graph_carries_reachable_self_alias_state_in_order():
+    tree = ast.parse(
+        """
+def send_packet():
+    return None
+
+class Worker:
+    def configure(self):
+        self.callback = publish_measurement
+
+    def _stream_loop(self):
+        self.configure()
+        self.callback()
+
+    def unrelated(self):
+        self.callback = send_packet
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"publish_measurement"}
+
+
+def test_rtsp_call_graph_indexes_invoked_nested_defs_in_compound_blocks():
+    tree = ast.parse(
+        """
+class Worker:
+    def _stream_loop(self):
+        if enabled:
+            def from_if():
+                publish_measurement()
+
+            def not_called():
+                draw_osd()
+
+        try:
+            def from_try():
+                update_servo_control()
+        except BaseException:
+            pass
+
+        for item in items:
+            def from_loop():
+                invalidate_control_state()
+
+        from_if()
+        from_try()
+        from_loop()
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {
+            "publish_measurement", "update_servo_control",
+            "invalidate_control_state",
+        }
+
+
+def test_rtsp_call_graph_does_not_taint_callee_from_uart_parameter_name():
+    tree = ast.parse(
+        """
+def send(uart):
+    uart.write(b"video")
+
+class Worker:
+    def _stream_loop(self, client):
+        send(client)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == set()
+
+
+def test_rtsp_call_graph_uses_late_bound_nested_function_aliases():
+    boundary_tree = ast.parse(
+        """
+def send_packet():
+    return None
+
+class Worker:
+    def _stream_loop(self):
+        callback = send_packet
+
+        def invoke():
+            callback()
+
+        callback = publish_measurement
+        invoke()
+""")
+    assert rtsp_worker_control_calls(
+        boundary_tree, "Worker", "_stream_loop") == {
+            "publish_measurement",
+        }
+
+    safe_tree = ast.parse(
+        """
+def send_packet():
+    return None
+
+class Worker:
+    def _stream_loop(self):
+        callback = publish_measurement
+
+        def invoke():
+            callback()
+
+        callback = send_packet
+        invoke()
+""")
+    assert rtsp_worker_control_calls(
+        safe_tree, "Worker", "_stream_loop") == set()
+
+
+def test_rtsp_call_graph_keeps_foreign_instance_state_separate():
+    tree = ast.parse(
+        """
+class Other:
+    def configure(self):
+        self.callback = publish_measurement
+
+class Worker:
+    def _stream_loop(self, client):
+        Other.configure(client)
+        self.callback()
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == set()
+
+
+def test_rtsp_call_graph_seeds_known_module_uart_roots():
+    tree = ast.parse(
+        """
+uart = UART(1)
+
+def send_control():
+    uart.write(b"X:+001,Y:+002\\n")
+
+class Worker:
+    def _stream_loop(self):
+        send_control()
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"uart.write"}
+
+
+def test_rtsp_call_graph_keeps_lexical_closure_through_helper_invocation():
+    boundary_tree = ast.parse(
+        """
+def invoke_helper(callback):
+    callback()
+
+def send_packet():
+    return None
+
+class Worker:
+    def _stream_loop(self):
+        callback = send_packet
+
+        def invoke():
+            callback()
+
+        callback = publish_measurement
+        invoke_helper(invoke)
+""")
+    assert rtsp_worker_control_calls(
+        boundary_tree, "Worker", "_stream_loop") == {
+            "publish_measurement",
+        }
+
+    safe_tree = ast.parse(
+        """
+def invoke_helper(callback):
+    callback()
+
+def send_packet():
+    return None
+
+class Worker:
+    def _stream_loop(self):
+        callback = publish_measurement
+
+        def invoke():
+            callback()
+
+        callback = send_packet
+        invoke_helper(invoke)
+""")
+    assert rtsp_worker_control_calls(
+        safe_tree, "Worker", "_stream_loop") == set()
+
+
+def test_rtsp_call_graph_preserves_foreign_state_within_nested_calls():
+    tree = ast.parse(
+        """
+class Other:
+    def configure(self):
+        self.callback = publish_measurement
+
+    def run(self):
+        self.configure()
+        self.callback()
+
+class Worker:
+    def _stream_loop(self, client):
+        Other.run(client)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"publish_measurement"}
+
+
+def test_rtsp_call_graph_keeps_captured_self_state_through_helper():
+    tree = ast.parse(
+        """
+def invoke_helper(callback):
+    callback()
+
+class Worker:
+    def _stream_loop(self):
+        self.callback = publish_measurement
+
+        def invoke():
+            self.callback()
+
+        invoke_helper(invoke)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"publish_measurement"}
+
+
 def test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting():
     assignments = {
         target.id: ast.literal_eval(item.value)
@@ -1341,6 +2026,18 @@ if __name__ == "__main__":
     test_rtsp_call_graph_tracks_positional_uart_provenance()
     test_rtsp_call_graph_keeps_network_argument_provenance_allowed()
     test_rtsp_call_graph_respects_nested_function_scope_and_invocation()
+    test_rtsp_call_graph_resolves_aliases_at_each_call_site()
+    test_rtsp_call_graph_maps_bound_method_arguments_after_self()
+    test_rtsp_call_graph_ignores_self_aliases_from_uncalled_methods()
+    test_rtsp_call_graph_carries_reachable_self_alias_state_in_order()
+    test_rtsp_call_graph_indexes_invoked_nested_defs_in_compound_blocks()
+    test_rtsp_call_graph_does_not_taint_callee_from_uart_parameter_name()
+    test_rtsp_call_graph_uses_late_bound_nested_function_aliases()
+    test_rtsp_call_graph_keeps_foreign_instance_state_separate()
+    test_rtsp_call_graph_seeds_known_module_uart_roots()
+    test_rtsp_call_graph_keeps_lexical_closure_through_helper_invocation()
+    test_rtsp_call_graph_preserves_foreign_state_within_nested_calls()
+    test_rtsp_call_graph_keeps_captured_self_state_through_helper()
     test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting()
     test_tracking_metrics_report_uses_exact_cadence_and_resets_window()
     test_tracking_metrics_report_guards_empty_averages_and_uses_ticks_diff()
