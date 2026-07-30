@@ -322,6 +322,32 @@ def valid_ball_box(box):
     return True
 
 
+def select_best_ai_ball(det_boxes):
+    best_capture = None
+    for det in det_boxes or []:
+        score = float(det[1])
+        x1 = float(det[2])
+        y1 = float(det[3])
+        x2 = float(det[4])
+        y2 = float(det[5])
+        width = x2 - x1
+        height = y2 - y1
+        if width < 4 or height < 4:
+            continue
+        if width > 170 or height > 170:
+            continue
+        if max(width, height) / min(width, height) > 1.8:
+            continue
+        if best_capture is None or score > best_capture["score"]:
+            best_capture = {
+                "box": [x1, y1, x2, y2],
+                "cx": int((x1 + x2) / 2),
+                "cy": int((y1 + y2) / 2),
+                "score": score,
+            }
+    return best_capture
+
+
 def smooth_box(old_box, new_box):
     a = SMOOTH_ALPHA
     return [
@@ -738,7 +764,7 @@ def should_render_osd(frame_number, cadence=2):
     return frame_number % cadence == 0
 
 
-def draw_osd(osd_img, stable_tracks, color_four, uart_obj, render_osd=True):
+def draw_osd(osd_img, capture, color_four, uart_obj, render_osd=True):
     global frame_counter, state
     global pos_hist_full
     global calib_stable_count, calib_last_cx, calib_last_cy
@@ -756,46 +782,31 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj, render_osd=True):
 
     gc_dx, gc_dy = ai_to_disp(GEOM_CENTER_X, GEOM_CENTER_Y)
 
-    # ---- 找最佳球 ----
-    count      = 0
-    raw_cx     = -1
-    raw_cy     = -1
+    # ---- 绘制当前 KPU 捕获 ----
+    count = 0
     best_score = 0.0
-
-    for trk in stable_tracks:
-        if not is_visible_track(trk):
-            continue
-        x1, y1, x2, y2 = trk["box"]
+    if capture is not None:
+        x1, y1, x2, y2 = capture["box"]
         bx, by = ai_to_disp(x1, y1)
         bw     = int((x2 - x1) * DISPLAY_WIDTH  // OUT_RGB888P_WIDTH)
         bh     = int((y2 - y1) * DISPLAY_HEIGHT // OUT_RGB888P_HEIGH)
-        if bw <= 0 or bh <= 0:
-            continue
+        if bw > 0 and bh > 0:
+            col = color_four[MERGED_CLASS_ID][1:]
+            circle_x, circle_y, circle_radius = detection_circle(bx, by, bw, bh)
+            if render_osd:
+                osd_img.draw_circle(
+                    circle_x, circle_y, circle_radius, color=col, thickness=2)
+                osd_img.draw_string_advanced(
+                    bx, max(0, by - 26), 22, DISPLAY_LABEL, color=col)
+        count = 1
+        best_score = capture["score"]
 
-        col = color_four[MERGED_CLASS_ID][1:]
-        circle_x, circle_y, circle_radius = detection_circle(bx, by, bw, bh)
-        if render_osd:
-            osd_img.draw_circle(
-                circle_x, circle_y, circle_radius, color=col, thickness=2)
-
-        tcx = int((x1 + x2) / 2)
-        tcy = int((y1 + y2) / 2)
-        lbl = DISPLAY_LABEL + ("*" if trk["lost"] > 0 else "")
-        if render_osd:
-            osd_img.draw_string_advanced(
-                bx, max(0, by - 26), 22, lbl, color=col)
-        count += 1
-        if trk["score"] > best_score:
-            best_score = trk["score"]
-            raw_cx     = tcx
-            raw_cy     = tcy
-
-    # ---- 中值滤波 ----
-    ball_valid = (raw_cx >= 0 and raw_cy >= 0)
+    ball_valid = control_state["valid"]
+    pos_hist_full = ball_valid
     if ball_valid:
-        filt_cx, filt_cy = median_filter_push(raw_cx, raw_cy)
+        filt_cx = control_state["x"]
+        filt_cy = control_state["y"]
     else:
-        pos_hist_full = False
         filt_cx, filt_cy = -1, -1
 
     # ============================================================
@@ -1104,13 +1115,18 @@ def detection():
                         num_classes, DETECT_CONF_THRESHOLD,
                         nms_threshold, anchors, nms_option)
 
-                    stable_tracks = update_tracks(det_boxes)
+                    capture = select_best_ai_ball(det_boxes)
+                    if capture is not None:
+                        publish_measurement(
+                            capture["cx"], capture["cy"], "kpu", time.ticks_ms())
+                    else:
+                        invalidate_control_state()
                     render_osd = should_render_osd(
                         frame_counter + 1, OSD_EVERY_N_FRAMES)
                     if render_osd:
                         osd_img.clear()
                     draw_osd(
-                        osd_img, stable_tracks, color_four, uart, render_osd)
+                        osd_img, capture, color_four, uart, render_osd)
                     if render_osd:
                         Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
 

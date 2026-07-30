@@ -28,6 +28,19 @@ def test_detection_circle_geometry():
     assert detection_circle(1, 2, 2, 2) == (2, 3, 4)
 
 
+def test_single_ai_capture_selects_highest_valid_confidence():
+    select_best_ai_ball = load_pure_function("select_best_ai_ball")
+    detections = [
+        [0, 0.40, 10, 10, 30, 30],
+        [0, 0.90, 100, 100, 130, 130],
+        [0, 0.99, 0, 0, 300, 10],
+    ]
+    result = select_best_ai_ball(detections)
+    assert result["cx"] == 115
+    assert result["cy"] == 115
+    assert result["score"] == 0.90
+
+
 def test_three_sample_velocity_and_bounded_prediction():
     estimate_velocity = load_pure_function("estimate_velocity")
     predict_position = load_pure_function("predict_position")
@@ -150,6 +163,7 @@ def test_wifi_scan_supports_firmware_info_objects():
 
 if __name__ == "__main__":
     test_detection_circle_geometry()
+    test_single_ai_capture_selects_highest_valid_confidence()
     test_three_sample_velocity_and_bounded_prediction()
     test_osd_updates_at_the_requested_cadence()
     test_control_ui_is_full_rate_and_rtc_is_removed()
