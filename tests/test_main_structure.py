@@ -28,12 +28,23 @@ def test_detection_circle_geometry():
     assert detection_circle(1, 2, 2, 2) == (2, 3, 4)
 
 
-def test_osd_updates_every_second_ai_frame():
+def test_osd_updates_at_the_requested_cadence():
     should_render_osd = load_pure_function("should_render_osd")
-    assert should_render_osd(1) is False
-    assert should_render_osd(2) is True
-    assert should_render_osd(3) is False
-    assert should_render_osd(4) is True
+    assert should_render_osd(1, 1) is True
+    assert should_render_osd(2, 1) is True
+    assert should_render_osd(3, 1) is True
+    assert should_render_osd(4, 1) is True
+
+
+def test_control_ui_is_full_rate_and_rtc_is_removed():
+    function_names = {
+        item.name for item in TREE.body if isinstance(item, ast.FunctionDef)
+    }
+    assert "format_iso_time" not in function_names
+    text = SOURCE.read_text(encoding="utf-8")
+    assert "System time:" not in text
+    assert "RTC time is not calibrated" not in text
+    assert "OSD_EVERY_N_FRAMES       = 1" in text
 
 
 def test_uart_updates_are_not_gated_by_osd_rendering():
@@ -128,7 +139,8 @@ def test_wifi_scan_supports_firmware_info_objects():
 
 if __name__ == "__main__":
     test_detection_circle_geometry()
-    test_osd_updates_every_second_ai_frame()
+    test_osd_updates_at_the_requested_cadence()
+    test_control_ui_is_full_rate_and_rtc_is_removed()
     test_uart_updates_are_not_gated_by_osd_rendering()
     test_h264_rtsp_replaces_mjpeg_transport()
     test_control_interface_and_model_paths_are_unchanged()

@@ -71,11 +71,6 @@ H264_BITRATE      = 1000       # Kbit/s
 H264_FPS          = 30         # 匹配摄像头/WBC，避免消费过慢形成帧积压
 H264_GOP          = 15
 
-def format_iso_time(epoch_s=None, millis=0):
-    """OSD 使用的 ISO 8601 本地时间（UTC+08:00）。"""
-    t = time.localtime() if epoch_s is None else time.localtime(epoch_s)
-    return ("%04d-%02d-%02dT%02d:%02d:%02d.%03d+08:00" %
-            (t[0], t[1], t[2], t[3], t[4], t[5], millis))
 # ============================================================
 # 状态机
 # ============================================================
@@ -96,7 +91,7 @@ MAX_DETECTIONS_PER_FRAME = 25
 PRINT_EVERY_N_FRAMES     = 30
 GC_EVERY_N_FRAMES        = 60      # 降低强制 GC 频率，减少周期性停顿
 PERF_EVERY_N_FRAMES      = 60      # 低频统计实际 AI 主循环性能
-OSD_EVERY_N_FRAMES       = 2       # 控制/UART 全帧运行，叠加层隔帧刷新
+OSD_EVERY_N_FRAMES       = 1       # 控制/UART 全帧运行，叠加层每帧刷新
 DISPLAY_LABEL            = "gz"
 MERGED_CLASS_ID          = 0       # 新模型只有 gangqiu 一个类
 MIN_BOX_SIZE             = 4
@@ -914,9 +909,6 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj, render_osd=True):
 def detection():
     global state
     print("=== Ball Position (new model) ===")
-    print("System time:", format_iso_time(time.time(), 0))
-    if time.localtime()[0] < 2024:
-        print("WARNING: RTC time is not calibrated; displayed time is invalid")
     wlan = None
 
     deploy_conf = read_deploy_config(config_path)
