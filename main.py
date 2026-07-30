@@ -631,6 +631,13 @@ def ai_to_disp(ax, ay):
 # OSD绘制
 # ============================================================
 
+def detection_circle(bx, by, bw, bh):
+    cx = bx + bw // 2
+    cy = by + bh // 2
+    radius = max(4, max(bw, bh) // 2 + 3)
+    return cx, cy, radius
+
+
 def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
     global frame_counter, state
     global pos_hist_full
@@ -666,7 +673,9 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
             continue
 
         col = color_four[MERGED_CLASS_ID][1:]
-        osd_img.draw_rectangle(bx, by, bw, bh, color=col, thickness=2)
+        circle_x, circle_y, circle_radius = detection_circle(bx, by, bw, bh)
+        osd_img.draw_circle(
+            circle_x, circle_y, circle_radius, color=col, thickness=2)
 
         tcx = int((x1 + x2) / 2)
         tcy = int((y1 + y2) / 2)
