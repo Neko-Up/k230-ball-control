@@ -19,7 +19,7 @@ ball position error + ball velocity
                  v
           target rod angle
                  |
-          clamp to +/-2.0 deg
+          clamp to +/-5.0 deg
                  |
                  v
  estimated rod angle error
@@ -30,7 +30,7 @@ ball position error + ball velocity
 
 ## Limits and Initial Parameters
 
-- Rod angle limit: +/-2.0 degrees for fast edge recovery.
+- Rod angle limit: +/-5.0 degrees for fast edge recovery.
 - Ball-position deadband: +/-0.15 cm.
 - Step frequency range: 150-400 Hz.
 - Direction changes must decelerate to zero before reversing.
@@ -49,22 +49,22 @@ fast large-angle correction.
 - Invalid or stale vision data immediately stops STEP output and disables EN.
 - The software watchdog remains active and must use a valid, reusable CanMV
   Timer lifecycle.
-- Estimated rod angle is always clamped to +/-2.0 degrees.
+- Estimated rod angle is always clamped to +/-5.0 degrees.
 - Reaching an angle boundary prevents further motion into that boundary but
   still permits motion back toward zero.
 
 ## Display and UART
 
 LCD and UART continue to publish the same real-time fields. The displayed `A`
-field represents estimated rod angle and must remain within +/-2.0 degrees. No
+field represents estimated rod angle and must remain within +/-5.0 degrees. No
 additional filtering may delay the vision measurements sent to the controller.
 
 ## Verification
 
 Automated tests must cover:
 
-- Target angle is clamped to +/-2.0 degrees.
-- A large ball error cannot command more than +/-2.0 degrees.
+- Target angle is clamped to +/-5.0 degrees.
+- A large ball error cannot command more than +/-5.0 degrees.
 - Deadband commands the rod back toward zero.
 - Direction reversal first reduces output to zero.
 - Invalid vision disables the driver.
@@ -74,6 +74,6 @@ On-board acceptance:
 
 1. Level the rod and tap zero.
 2. Move the ball 1-5 cm from target.
-3. Confirm the rod never exceeds +/-2.0 degrees.
+3. Confirm the rod never exceeds +/-5.0 degrees.
 4. Confirm the rod returns near zero as the ball enters the deadband.
 5. Confirm no LCD blackout or runtime exception occurs.
