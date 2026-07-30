@@ -18,6 +18,7 @@ PURE_CONSTANTS = {
         "TRACK_SEARCH", "TRACK_ACTIVE", "TRACK_RECOVER",
         "AI_VALIDATE_INTERVAL", "BLOB_LOST_TO_RECOVER",
         "AI_FAILURES_TO_RECOVER", "AI_BLOB_IDENTITY_MAX_DISTANCE",
+        "METRICS_EVERY_N_CONTROL_FRAMES",
     }
 }
 
@@ -799,22 +800,48 @@ def test_rtsp_worker_isolated_from_control_outputs_and_startup_is_guarded():
     assert thread_calls[0].args[0].attr == "_stream_loop"
 
     guarded_thread_start = any(
-        thread_calls[0] in ast.walk(branch)
+        thread_calls[0] in ast.walk(statement)
         for branch in ast.walk(start)
         if isinstance(branch, ast.Try) and branch.handlers
+        for statement in branch.body
     )
     assert guarded_thread_start
 
+    reachable = set()
+    pending = ["_stream_loop"]
+    while pending:
+        method_name = pending.pop()
+        if method_name in reachable:
+            continue
+        reachable.add(method_name)
+        for call in (
+                node for node in ast.walk(methods[method_name])
+                if isinstance(node, ast.Call)):
+            if (isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "self"
+                    and call.func.attr in methods):
+                pending.append(call.func.attr)
+
+    assert {
+        "_stream_loop", "_encoder_send_frame", "_encoder_get_stream",
+        "_encoder_release_stream", "_send_pack",
+    } <= reachable
+    forbidden_names = {
+        "publish_measurement", "update_servo_control",
+        "publish_control_outputs", "draw_osd", "format_deviation_msg",
+        "invalidate_control_state",
+    }
     forbidden_calls = []
-    for call in (
-            node for node in ast.walk(stream_loop)
-            if isinstance(node, ast.Call)):
-        if isinstance(call.func, ast.Name):
-            forbidden_calls.append(call.func.id)
-        elif isinstance(call.func, ast.Attribute):
-            forbidden_calls.append(call.func.attr)
-    assert "publish_measurement" not in forbidden_calls
-    assert "update_servo_control" not in forbidden_calls
+    for method_name in reachable:
+        for call in (
+                node for node in ast.walk(methods[method_name])
+                if isinstance(node, ast.Call)):
+            if isinstance(call.func, ast.Name):
+                forbidden_calls.append(call.func.id)
+            elif isinstance(call.func, ast.Attribute):
+                forbidden_calls.append(call.func.attr)
+    assert not forbidden_names.intersection(forbidden_calls)
     assert "write" not in forbidden_calls
 
 
@@ -844,31 +871,24 @@ def test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting():
         "prediction_clamp_count": 0,
     }
 
+    function_names = {
+        item.name for item in TREE.body if isinstance(item, ast.FunctionDef)
+    }
+    assert "tracking_metrics_report" in function_names
+
     detection = next(
         item
         for item in TREE.body
         if isinstance(item, ast.FunctionDef) and item.name == "detection"
     )
-    metric_prints = [
+    report_calls = [
         call
         for call in ast.walk(detection)
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Name)
-        and call.func.id == "print"
-        and any(
-            isinstance(value, ast.Constant)
-            and isinstance(value.value, str)
-            and "TRACK:" in value.value
-            and "CTRL:" in value.value
-            and "Blob:" in value.value
-            and "KPU:" in value.value
-            and "Lost:" in value.value
-            and "Reacq:" in value.value
-            and "Clamp:" in value.value
-            for value in ast.walk(call)
-        )
+        and call.func.id == "tracking_metrics_report"
     ]
-    assert len(metric_prints) == 1
+    assert len(report_calls) == 1
 
     metric_guards = [
         branch
@@ -881,7 +901,98 @@ def test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting():
         )
     ]
     assert len(metric_guards) == 1
-    assert metric_prints[0] in ast.walk(metric_guards[0])
+    assert report_calls[0] in ast.walk(metric_guards[0])
+
+
+def test_tracking_metrics_report_uses_exact_cadence_and_resets_window():
+    class FakeTime:
+        @staticmethod
+        def ticks_diff(now_ms, start_ms):
+            return now_ms - start_ms
+
+    report = load_pure_function(
+        "tracking_metrics_report", {"time": FakeTime})
+    assert report(
+        59, "TRACK", 160, 100,
+        3, 30, 2, 20, 4, 5, 6) is None
+    assert report(
+        61, "TRACK", 160, 100,
+        3, 30, 2, 20, 4, 5, 6) is None
+    result = report(
+        60, "TRACK", 160, 100,
+        3, 30, 2, 20, 4, 5, 6)
+    assert result == (
+        "TRACK:TRACK CTRL:1000.0 Blob:10.0 KPU:10.0 "
+        "Lost:4 Reacq:5 Clamp:6",
+        160, 0, 0, 0, 0, 0, 0, 0,
+    )
+
+
+def test_tracking_metrics_report_guards_empty_averages_and_uses_ticks_diff():
+    class FakeTime:
+        calls = []
+
+        @staticmethod
+        def ticks_diff(now_ms, start_ms):
+            FakeTime.calls.append((now_ms, start_ms))
+            return 25
+
+    report = load_pure_function(
+        "tracking_metrics_report", {"time": FakeTime})
+    result = report(
+        120, "RECOVER", 3, 0xfffffff0,
+        0, 0, 0, 0, 0, 0, 0)
+    assert result[0] == (
+        "TRACK:RECOVER CTRL:2400.0 Blob:0.0 KPU:0.0 "
+        "Lost:0 Reacq:0 Clamp:0")
+    assert FakeTime.calls == [(3, 0xfffffff0)]
+
+
+def test_kpu_latency_metrics_only_measure_track_validation_processing():
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    validation_guards = [
+        branch
+        for branch in ast.walk(detection)
+        if isinstance(branch, ast.If)
+        and any(
+            isinstance(name, ast.Name) and name.id == "is_kpu_validation"
+            for name in ast.walk(branch.test)
+        )
+    ]
+    assert validation_guards
+    validation_updates = {
+        target.id
+        for branch in validation_guards
+        for node in ast.walk(branch)
+        if isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id in {"kpu_validation_count", "kpu_total_ms"}
+        for target in (node.target,)
+    }
+    assert validation_updates == {"kpu_validation_count", "kpu_total_ms"}
+
+    first_ai_startup = next(
+        branch
+        for branch in ast.walk(detection)
+        if isinstance(branch, ast.If)
+        and isinstance(branch.test, ast.Name)
+        and branch.test.id == "first_ai_frame"
+    )
+    kpu_timing_starts = [
+        node
+        for node in ast.walk(detection)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "kpu_start_ms"
+            for target in node.targets
+        )
+    ]
+    assert len(kpu_timing_starts) == 1
+    assert kpu_timing_starts[0].lineno > first_ai_startup.end_lineno
 
 
 def test_wifi_scan_supports_firmware_info_objects():
@@ -927,5 +1038,8 @@ if __name__ == "__main__":
     test_rtsp_void_and_zero_returns_are_successful()
     test_rtsp_worker_isolated_from_control_outputs_and_startup_is_guarded()
     test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting()
+    test_tracking_metrics_report_uses_exact_cadence_and_resets_window()
+    test_tracking_metrics_report_guards_empty_averages_and_uses_ticks_diff()
+    test_kpu_latency_metrics_only_measure_track_validation_processing()
     test_wifi_scan_supports_firmware_info_objects()
     print("tests: OK")

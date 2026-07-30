@@ -282,6 +282,33 @@ def publish_measurement(x, y, source, now_ms):
     }
 
 
+def tracking_metrics_report(
+        frame_count, tracking_state, now_ms, start_ms,
+        blob_frames, blob_ms, kpu_validations, kpu_ms,
+        blob_losses, kpu_reacquires, prediction_clamps):
+    if (frame_count <= 0 or
+            frame_count % METRICS_EVERY_N_CONTROL_FRAMES != 0):
+        return None
+    elapsed_ms = time.ticks_diff(now_ms, start_ms)
+    control_fps = 0.0
+    if elapsed_ms > 0:
+        control_fps = (
+            METRICS_EVERY_N_CONTROL_FRAMES * 1000.0 / elapsed_ms)
+    blob_avg_ms = 0.0
+    if blob_frames > 0:
+        blob_avg_ms = blob_ms * 1.0 / blob_frames
+    kpu_avg_ms = 0.0
+    if kpu_validations > 0:
+        kpu_avg_ms = kpu_ms * 1.0 / kpu_validations
+    return (
+        "TRACK:{} CTRL:{:.1f} Blob:{:.1f} KPU:{:.1f} "
+        "Lost:{} Reacq:{} Clamp:{}".format(
+            tracking_state, control_fps, blob_avg_ms, kpu_avg_ms,
+            blob_losses, kpu_reacquires, prediction_clamps),
+        now_ms, 0, 0, 0, 0, 0, 0, 0,
+    )
+
+
 def invalidate_control_state():
     global control_state, motion_samples
     motion_samples = []
@@ -1404,7 +1431,9 @@ def detection():
                     out_data = None
                     result = None
                     det_boxes = None
-                    kpu_start_ms = time.ticks_ms()
+                    is_kpu_validation = (
+                        blob_channel_available and
+                        tracker_state == TRACK_ACTIVE)
                     try:
                         rgb888p_img = sensor.snapshot(
                             chn=CAM_CHN_ID_2, timeout=2000)
@@ -1423,6 +1452,8 @@ def detection():
                                     print("RTSP disabled after initialization failure:", e)
 
                         if rgb888p_img.format() == image.RGBP888:
+                            if is_kpu_validation:
+                                kpu_start_ms = time.ticks_ms()
                             ai2d_input = rgb888p_img.to_numpy_ref()
                             ai2d_input_tensor = nn.from_numpy(ai2d_input)
                             ai2d_builder.run(
@@ -1448,6 +1479,10 @@ def detection():
                                 num_classes, DETECT_CONF_THRESHOLD,
                                 nms_threshold, anchors, nms_option)
                             capture = select_best_ai_ball(det_boxes)
+                            if is_kpu_validation:
+                                kpu_validation_count += 1
+                                kpu_total_ms += time.ticks_diff(
+                                    time.ticks_ms(), kpu_start_ms)
                     finally:
                         del det_boxes
                         del result
@@ -1456,10 +1491,6 @@ def detection():
                         del ai2d_input_tensor
                         del ai2d_input
                         del rgb888p_img
-
-                    kpu_validation_count += 1
-                    kpu_total_ms += time.ticks_diff(
-                        time.ticks_ms(), kpu_start_ms)
 
                     ai_valid = capture is not None
                     if ai_valid and tracker_state == TRACK_RECOVER:
@@ -1540,36 +1571,17 @@ def detection():
 
                 if (frame_counter % METRICS_EVERY_N_CONTROL_FRAMES == 0):
                     metrics_now_ms = time.ticks_ms()
-                    metrics_elapsed_ms = time.ticks_diff(
-                        metrics_now_ms, metrics_start_ms)
-                    control_fps = 0.0
-                    if metrics_elapsed_ms > 0:
-                        control_fps = (
-                            METRICS_EVERY_N_CONTROL_FRAMES * 1000.0 /
-                            metrics_elapsed_ms)
-                    blob_avg_ms = 0.0
-                    if blob_frame_count > 0:
-                        blob_avg_ms = (
-                            blob_total_ms * 1.0 / blob_frame_count)
-                    kpu_avg_ms = 0.0
-                    if kpu_validation_count > 0:
-                        kpu_avg_ms = (
-                            kpu_total_ms * 1.0 / kpu_validation_count)
-                    print(
-                        "TRACK:{} CTRL:{:.1f} Blob:{:.1f} KPU:{:.1f} "
-                        "Lost:{} Reacq:{} Clamp:{}".format(
-                            tracker_state, control_fps, blob_avg_ms,
-                            kpu_avg_ms, blob_loss_count,
-                            kpu_reacquire_count,
-                            prediction_clamp_count))
-                    metrics_start_ms = metrics_now_ms
-                    blob_frame_count = 0
-                    blob_total_ms = 0
-                    kpu_validation_count = 0
-                    kpu_total_ms = 0
-                    blob_loss_count = 0
-                    kpu_reacquire_count = 0
-                    prediction_clamp_count = 0
+                    (metrics_line, metrics_start_ms,
+                     blob_frame_count, blob_total_ms,
+                     kpu_validation_count, kpu_total_ms,
+                     blob_loss_count, kpu_reacquire_count,
+                     prediction_clamp_count) = tracking_metrics_report(
+                        frame_counter, tracker_state, metrics_now_ms,
+                        metrics_start_ms, blob_frame_count, blob_total_ms,
+                        kpu_validation_count, kpu_total_ms,
+                        blob_loss_count, kpu_reacquire_count,
+                        prediction_clamp_count)
+                    print(metrics_line)
 
                 gc_frame_count += 1
                 if gc_frame_count >= GC_EVERY_N_FRAMES:
