@@ -157,14 +157,16 @@ STEPPER_STEP_IO = 42
 STEPPER_PWM_CHANNEL = 0
 STEPPER_DIR_IO = 5
 STEPPER_EN_IO = 6
-STEPPER_KP_HZ_PER_CM = 400.0
-STEPPER_KD_HZ_PER_CM_S = 30.0
-STEPPER_DEADBAND_CM = 0.20
-STEPPER_MIN_FREQUENCY_HZ = 120.0
-STEPPER_MAX_FREQUENCY_HZ = 1800.0
-STEPPER_FREQUENCY_RAMP_HZ_S = 4000.0
+STEPPER_KP_ANGLE_DEG_PER_CM = 0.18
+STEPPER_KD_ANGLE_DEG_PER_CM_S = 0.04
+STEPPER_ANGLE_TRACK_HZ_PER_DEG = 800.0
+STEPPER_ANGLE_TOLERANCE_DEG = 0.03
+STEPPER_DEADBAND_CM = 0.15
+STEPPER_MIN_FREQUENCY_HZ = 40.0
+STEPPER_MAX_FREQUENCY_HZ = 500.0
+STEPPER_FREQUENCY_RAMP_HZ_S = 1500.0
 STEPPER_PULSES_PER_ROD_DEG = 8.8889  # 1.8 deg motor, 1/16, direct drive
-STEPPER_ANGLE_LIMIT_DEG = 8.0
+STEPPER_ANGLE_LIMIT_DEG = 1.0
 STEPPER_DIRECTION_INVERT = False
 STEPPER_VISION_TIMEOUT_MS = 150
 STEPPER_WATCHDOG_TIMER_ID = -1  # software timer; media pipeline owns hard timers
@@ -235,6 +237,7 @@ def new_stepper_control_state(now_ms=0):
         "direction": 0,
         "motion_sign": 0,
         "estimated_angle_deg": 0.0,
+        "target_angle_deg": 0.0,
         "last_update_ms": now_ms,
         "fault": "not_zeroed",
     }
@@ -242,8 +245,9 @@ def new_stepper_control_state(now_ms=0):
 
 def compute_stepper_command(
         error_cm, velocity_cm_s, measurement_valid, zeroed,
-        now_ms, state, kp_hz_per_cm, kd_hz_per_cm_s,
-        deadband_cm, min_frequency_hz, max_frequency_hz,
+        now_ms, state, kp_angle_deg_per_cm, kd_angle_deg_per_cm_s,
+        angle_track_hz_per_deg, angle_tolerance_deg, deadband_cm,
+        min_frequency_hz, max_frequency_hz,
         frequency_ramp_hz_s, pulses_per_degree, angle_limit_deg,
         max_motion_ms,
         direction_invert=False, ticks_diff_fn=None):
@@ -271,6 +275,7 @@ def compute_stepper_command(
         "direction": 0,
         "motion_sign": 0,
         "estimated_angle_deg": estimated_angle,
+        "target_angle_deg": 0.0,
         "last_update_ms": now_ms,
         "fault": "none",
     }
@@ -280,23 +285,31 @@ def compute_stepper_command(
     if not measurement_valid:
         result["fault"] = "vision_invalid"
         return result
-    if abs(error_cm) <= deadband_cm and abs(velocity_cm_s) < 0.05:
-        result["fault"] = "deadband"
+
+    if abs(error_cm) <= deadband_cm:
+        target_angle = 0.0
+    else:
+        target_angle = (
+            kp_angle_deg_per_cm * error_cm -
+            kd_angle_deg_per_cm_s * velocity_cm_s)
+    target_angle = max(
+        -angle_limit_deg, min(angle_limit_deg, target_angle))
+    result["target_angle_deg"] = target_angle
+    angle_error = target_angle - estimated_angle
+    if abs(angle_error) <= angle_tolerance_deg:
+        result["fault"] = "angle_deadband"
         return result
 
-    effort_hz = (kp_hz_per_cm * error_cm -
-                 kd_hz_per_cm_s * velocity_cm_s)
-    if abs(effort_hz) < 1.0:
-        result["fault"] = "deadband"
-        return result
-    logical_direction = 1 if effort_hz > 0.0 else -1
+    logical_direction = 1 if angle_error > 0.0 else -1
     if ((estimated_angle >= angle_limit_deg and logical_direction > 0) or
             (estimated_angle <= -angle_limit_deg and logical_direction < 0)):
         result["fault"] = "angle_limit"
         return result
 
     target_frequency = max(
-        min(abs(effort_hz), max_frequency_hz), min_frequency_hz)
+        min(abs(angle_error) * angle_track_hz_per_deg,
+            max_frequency_hz),
+        min_frequency_hz)
     max_delta = frequency_ramp_hz_s * elapsed_s
     if previous_sign != 0 and previous_sign != logical_direction:
         next_frequency = max(0.0, previous_frequency - max_delta)
@@ -1468,12 +1481,13 @@ def format_deviation_msg(dx, dy, valid):
 
 
 def format_stepper_msg(command):
-    return "M:{},R:{},F:{:04d},D:{:+d},A:{:+.2f},E:{}\n".format(
+    return "M:{},R:{},F:{:04d},D:{:+d},A:{:+.2f},T:{:+.2f},E:{}\n".format(
         1 if command.get("zeroed", False) else 0,
         1 if command.get("enabled", False) else 0,
         int(round(command.get("frequency_hz", 0.0))),
         int(command.get("direction", 0)),
         float(command.get("estimated_angle_deg", 0.0)),
+        float(command.get("target_angle_deg", 0.0)),
         command.get("fault", "unknown")).encode("utf-8")
 
 
@@ -1712,6 +1726,7 @@ def handle_stepper_zero_touch(stepper_state, points, target_ready,
         "direction": 0,
         "motion_sign": 0,
         "estimated_angle_deg": 0.0,
+        "target_angle_deg": 0.0,
         "last_update_ms": now_ms,
         "fault": "vision_invalid",
     })
@@ -1811,7 +1826,8 @@ def update_stepper_control(measurement, stepper, stepper_state,
         measurement.get("velocity_cm_s", 0.0),
         vision_fresh, stepper_state.get("zeroed", False),
         now_ms, stepper_state,
-        STEPPER_KP_HZ_PER_CM, STEPPER_KD_HZ_PER_CM_S,
+        STEPPER_KP_ANGLE_DEG_PER_CM, STEPPER_KD_ANGLE_DEG_PER_CM_S,
+        STEPPER_ANGLE_TRACK_HZ_PER_DEG, STEPPER_ANGLE_TOLERANCE_DEG,
         STEPPER_DEADBAND_CM, STEPPER_MIN_FREQUENCY_HZ,
         STEPPER_MAX_FREQUENCY_HZ, STEPPER_FREQUENCY_RAMP_HZ_S,
         STEPPER_PULSES_PER_ROD_DEG, STEPPER_ANGLE_LIMIT_DEG,
@@ -1958,8 +1974,9 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
                 color=C_WHITE)
             osd_img.draw_string_advanced(
                 DISPLAY_WIDTH - 240, 140, 17,
-                "A:{:+.2f} {}".format(
+                "A:{:+.2f}/{:+.2f} {}".format(
                     stepper_state.get("estimated_angle_deg", 0.0),
+                    stepper_state.get("target_angle_deg", 0.0),
                     stepper_state.get("fault", "unknown")),
                 color=C_GREEN_TEXT if stepper_state.get("enabled") else C_WHITE)
             osd_img.draw_string_advanced(

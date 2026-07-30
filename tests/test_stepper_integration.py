@@ -94,10 +94,20 @@ def test_stepper_uart_frame_exposes_realtime_command():
     fn = load_functions("format_stepper_msg")["format_stepper_msg"]
     message = fn({
         "zeroed": True, "enabled": True, "frequency_hz": 345.4,
-        "direction": -1, "estimated_angle_deg": 1.25,
+        "direction": -1, "estimated_angle_deg": 0.25,
+        "target_angle_deg": -0.40,
         "fault": "none",
     })
-    assert message == b"M:1,R:1,F:0345,D:-1,A:+1.25,E:none\n"
+    assert message == (
+        b"M:1,R:1,F:0345,D:-1,A:+0.25,T:-0.40,E:none\n")
+
+
+def test_lcd_exposes_estimated_and_target_rod_angles():
+    draw = next(
+        node for node in TREE.body
+        if isinstance(node, ast.FunctionDef) and node.name == "draw_osd"
+    )
+    assert "A:{:+.2f}/{:+.2f}" in ast.unparse(draw)
 
 
 def test_axis_distance_is_drawn_before_zero_prompt_overlay():

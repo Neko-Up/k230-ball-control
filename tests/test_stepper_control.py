@@ -21,7 +21,9 @@ def base_state(now_ms=1000):
     return {
         "frequency_hz": 0.0,
         "direction": 0,
+        "motion_sign": 0,
         "estimated_angle_deg": 0.0,
+        "target_angle_deg": 0.0,
         "last_update_ms": now_ms,
     }
 
@@ -34,14 +36,16 @@ def command(**overrides):
         "zeroed": True,
         "now_ms": 1020,
         "state": base_state(),
-        "kp_hz_per_cm": 400.0,
-        "kd_hz_per_cm_s": 30.0,
-        "deadband_cm": 0.2,
-        "min_frequency_hz": 120.0,
-        "max_frequency_hz": 1800.0,
-        "frequency_ramp_hz_s": 4000.0,
+        "kp_angle_deg_per_cm": 0.18,
+        "kd_angle_deg_per_cm_s": 0.04,
+        "angle_track_hz_per_deg": 800.0,
+        "angle_tolerance_deg": 0.03,
+        "deadband_cm": 0.15,
+        "min_frequency_hz": 40.0,
+        "max_frequency_hz": 500.0,
+        "frequency_ramp_hz_s": 1500.0,
         "pulses_per_degree": 8.8889,
-        "angle_limit_deg": 8.0,
+        "angle_limit_deg": 1.0,
         "max_motion_ms": 150,
         "direction_invert": False,
         "ticks_diff_fn": lambda now, before: now - before,
@@ -54,14 +58,16 @@ def test_deadband_stops_stepper():
     result = command(error_cm=0.1)
     assert result["enabled"] is False
     assert result["frequency_hz"] == 0.0
-    assert result["fault"] == "deadband"
+    assert result["target_angle_deg"] == 0.0
+    assert result["fault"] == "angle_deadband"
 
 
 def test_position_error_selects_direction_and_ramps_frequency():
     result = command(error_cm=1.0)
     assert result["enabled"] is True
     assert result["direction"] == 1
-    assert result["frequency_hz"] == 120.0
+    assert result["target_angle_deg"] == 0.18
+    assert result["frequency_hz"] == 40.0
 
 
 def test_derivative_damping_can_reverse_command():
@@ -73,27 +79,29 @@ def test_derivative_damping_can_reverse_command():
 
 def test_frequency_is_clamped_to_configured_maximum():
     result = command(error_cm=20.0, frequency_ramp_hz_s=1000000.0)
-    assert result["frequency_hz"] == 1800.0
+    assert result["target_angle_deg"] == 1.0
+    assert result["frequency_hz"] == 500.0
 
 
 def test_previous_motion_is_integrated_before_new_command():
     state = base_state()
-    state.update({"frequency_hz": 888.89, "direction": 1})
+    state.update({"frequency_hz": 88.889, "direction": 1,
+                  "motion_sign": 1})
     result = command(state=state, error_cm=0.0)
-    assert abs(result["estimated_angle_deg"] - 2.0) < 0.002
+    assert abs(result["estimated_angle_deg"] - 0.2) < 0.002
 
 
 def test_outward_motion_at_angle_limit_is_blocked():
     state = base_state()
-    state["estimated_angle_deg"] = 8.0
-    result = command(state=state, error_cm=1.0)
+    state["estimated_angle_deg"] = 1.0
+    result = command(state=state, error_cm=20.0)
     assert result["enabled"] is False
-    assert result["fault"] == "angle_limit"
+    assert result["fault"] == "angle_deadband"
 
 
 def test_inward_motion_at_angle_limit_is_allowed():
     state = base_state()
-    state["estimated_angle_deg"] = 8.0
+    state["estimated_angle_deg"] = 1.0
     result = command(state=state, error_cm=-1.0)
     assert result["enabled"] is True
     assert result["direction"] == -1
@@ -116,22 +124,50 @@ def test_direction_inversion_only_changes_physical_direction():
 
 def test_long_frame_integrates_only_watchdog_bounded_motion():
     state = base_state()
-    state.update({"frequency_hz": 100.0, "direction": 1})
+    state.update({"frequency_hz": 100.0, "direction": 1,
+                  "motion_sign": 1})
     result = command(state=state, now_ms=3000, error_cm=0.0)
-    assert abs(result["estimated_angle_deg"] - 1.6875) < 0.002
+    assert result["estimated_angle_deg"] == 1.0
 
 
 def test_frequency_deceleration_uses_same_ramp_limit():
     state = base_state()
-    state.update({"frequency_hz": 500.0, "direction": 1})
-    result = command(state=state, error_cm=0.5)
-    assert result["frequency_hz"] == 420.0
+    state.update({"frequency_hz": 300.0, "direction": 1,
+                  "motion_sign": 1})
+    result = command(state=state, error_cm=20.0)
+    assert result["frequency_hz"] == 270.0
 
 
 def test_direction_reversal_decelerates_before_switching_direction():
     state = base_state()
-    state.update({"frequency_hz": 500.0, "direction": 1})
+    state.update({"frequency_hz": 300.0, "direction": 1,
+                  "motion_sign": 1})
     result = command(state=state, error_cm=-1.0)
     assert result["direction"] == 1
-    assert result["frequency_hz"] == 420.0
+    assert result["frequency_hz"] == 270.0
     assert result["fault"] == "reversing"
+
+
+def test_large_ball_error_clamps_target_angle_to_one_degree():
+    result = command(error_cm=20.0, frequency_ramp_hz_s=1000000.0)
+    assert result["target_angle_deg"] == 1.0
+    assert result["frequency_hz"] <= 500.0
+
+
+def test_inner_loop_tracks_target_from_estimated_angle():
+    state = base_state()
+    state["estimated_angle_deg"] = 0.8
+    result = command(state=state, error_cm=1.0,
+                     frequency_ramp_hz_s=1000000.0)
+    assert result["target_angle_deg"] == 0.18
+    assert result["direction"] == -1
+
+
+def test_ball_deadband_returns_nonlevel_rod_toward_zero():
+    state = base_state()
+    state["estimated_angle_deg"] = 0.5
+    result = command(state=state, error_cm=0.1,
+                     frequency_ramp_hz_s=1000000.0)
+    assert result["target_angle_deg"] == 0.0
+    assert result["enabled"] is True
+    assert result["direction"] == -1
