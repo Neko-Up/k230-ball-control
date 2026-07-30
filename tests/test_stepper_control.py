@@ -38,6 +38,7 @@ def command(**overrides):
         "state": base_state(),
         "kp_angle_deg_per_cm": 0.18,
         "kd_angle_deg_per_cm_s": 0.04,
+        "edge_boost_deg_per_cm2": 0.0,
         "angle_track_hz_per_deg": 800.0,
         "angle_tolerance_deg": 0.03,
         "deadband_cm": 0.15,
@@ -162,6 +163,17 @@ def test_large_ball_error_clamps_target_angle_to_one_degree():
     result = command(error_cm=20.0, frequency_ramp_hz_s=1000000.0)
     assert result["target_angle_deg"] == 1.0
     assert result["frequency_hz"] <= 500.0
+
+
+def test_edge_boost_requests_strong_lift_near_pipe_end():
+    result = command(
+        error_cm=12.5,
+        kp_angle_deg_per_cm=0.45,
+        kd_angle_deg_per_cm_s=0.06,
+        edge_boost_deg_per_cm2=0.06,
+        angle_limit_deg=16.0,
+        frequency_ramp_hz_s=1000000.0)
+    assert abs(result["target_angle_deg"] - 15.0) < 0.001
 
 
 def test_inner_loop_tracks_target_from_estimated_angle():

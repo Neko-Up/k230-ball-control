@@ -159,6 +159,7 @@ STEPPER_DIR_IO = 5
 STEPPER_EN_IO = 6
 STEPPER_KP_ANGLE_DEG_PER_CM = 0.45
 STEPPER_KD_ANGLE_DEG_PER_CM_S = 0.06
+STEPPER_EDGE_BOOST_DEG_PER_CM2 = 0.06
 STEPPER_ANGLE_TRACK_HZ_PER_DEG = 1200.0
 STEPPER_ANGLE_TOLERANCE_DEG = 0.03
 STEPPER_DEADBAND_CM = 0.15
@@ -246,6 +247,7 @@ def new_stepper_control_state(now_ms=0):
 def compute_stepper_command(
         error_cm, velocity_cm_s, measurement_valid, zeroed,
         now_ms, state, kp_angle_deg_per_cm, kd_angle_deg_per_cm_s,
+        edge_boost_deg_per_cm2,
         angle_track_hz_per_deg, angle_tolerance_deg, deadband_cm,
         min_frequency_hz, max_frequency_hz,
         frequency_ramp_hz_s, pulses_per_degree, angle_limit_deg,
@@ -292,7 +294,8 @@ def compute_stepper_command(
         target_angle = 0.0
     else:
         target_angle = (
-            kp_angle_deg_per_cm * error_cm -
+            kp_angle_deg_per_cm * error_cm +
+            edge_boost_deg_per_cm2 * error_cm * abs(error_cm) -
             kd_angle_deg_per_cm_s * velocity_cm_s)
     target_angle = max(
         -angle_limit_deg, min(angle_limit_deg, target_angle))
@@ -1833,6 +1836,7 @@ def update_stepper_control(measurement, stepper, stepper_state,
         vision_fresh, stepper_state.get("zeroed", False),
         now_ms, stepper_state,
         STEPPER_KP_ANGLE_DEG_PER_CM, STEPPER_KD_ANGLE_DEG_PER_CM_S,
+        STEPPER_EDGE_BOOST_DEG_PER_CM2,
         STEPPER_ANGLE_TRACK_HZ_PER_DEG, STEPPER_ANGLE_TOLERANCE_DEG,
         STEPPER_DEADBAND_CM, STEPPER_MIN_FREQUENCY_HZ,
         STEPPER_MAX_FREQUENCY_HZ, STEPPER_FREQUENCY_RAMP_HZ_S,

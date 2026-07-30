@@ -28,6 +28,7 @@ def test_field_tuning_prioritizes_fast_edge_recovery():
     assert assigned_value("STEPPER_DIRECTION_INVERT") is True
     assert assigned_value("STEPPER_KP_ANGLE_DEG_PER_CM") == 0.45
     assert assigned_value("STEPPER_KD_ANGLE_DEG_PER_CM_S") == 0.06
+    assert assigned_value("STEPPER_EDGE_BOOST_DEG_PER_CM2") == 0.06
     assert assigned_value("STEPPER_ANGLE_TRACK_HZ_PER_DEG") == 1200.0
     assert assigned_value("STEPPER_MIN_FREQUENCY_HZ") == 150.0
     assert assigned_value("STEPPER_MAX_FREQUENCY_HZ") == 400.0
