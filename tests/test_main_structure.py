@@ -51,7 +51,8 @@ UART_OBJECT_NAMES = {"uart", "uart_obj"}
 
 def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
     module_functions = {
-        item.name: item for item in tree.body if isinstance(item, ast.FunctionDef)
+        item.name: item
+        for item in tree.body if isinstance(item, ast.FunctionDef)
     }
     class_methods = {
         item.name: {
@@ -63,27 +64,61 @@ def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
         if isinstance(item, ast.ClassDef)
     }
 
-    def aliases_in(nodes, include_self_attributes=False):
+    def scope_nodes(statements):
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.ClassDef,
+                                      ast.Lambda)):
+                continue
+            yield statement
+            for child in ast.iter_child_nodes(statement):
+                if isinstance(child, ast.stmt):
+                    yield from scope_nodes([child])
+
+    def aliases_in(statements, include_self_attributes=False):
         aliases = {}
-        for node in nodes:
-            for assignment in (
-                    item for item in ast.walk(node)
-                    if isinstance(item, ast.Assign) and len(item.targets) == 1):
-                target = assignment.targets[0]
-                if isinstance(target, ast.Name):
-                    aliases[target.id] = assignment.value
-                elif (include_self_attributes
-                      and isinstance(target, ast.Attribute)
-                      and isinstance(target.value, ast.Name)
-                      and target.value.id == "self"):
-                    aliases[target.attr] = assignment.value
+        for node in scope_nodes(statements):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                aliases[target.id] = node.value
+            elif (include_self_attributes
+                  and isinstance(target, ast.Attribute)
+                  and isinstance(target.value, ast.Name)
+                  and target.value.id == "self"):
+                aliases[target.attr] = node.value
         return aliases
 
     module_aliases = aliases_in(tree.body)
     class_aliases = {
-        class_name: aliases_in(methods.values(), True)
+        class_name: aliases_in(
+            [statement for method in methods.values()
+             for statement in method.body], True)
         for class_name, methods in class_methods.items()
     }
+
+    node_by_key = {
+        ("module", name): node for name, node in module_functions.items()
+    }
+    node_by_key.update({
+        ("class", class_name, method_name): node
+        for class_name, methods in class_methods.items()
+        for method_name, node in methods.items()
+    })
+
+    def function_params(node):
+        return [argument.arg for argument in node.args.args]
+
+    def local_functions(node):
+        return {
+            statement.name: statement
+            for statement in node.body if isinstance(statement, ast.FunctionDef)
+        }
+
+    def local_key(node):
+        key = ("local", id(node))
+        node_by_key[key] = node
+        return key
 
     def class_name_for(expression, aliases, resolving=None):
         if resolving is None:
@@ -97,16 +132,22 @@ def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
             return class_name_for(aliases[expression.id], aliases, resolving)
         return None
 
-    def resolve_callable(expression, aliases, class_name, resolving=None):
+    def resolve_callable(expression, aliases, class_name, functions,
+                         resolving=None):
         if resolving is None:
             resolving = set()
         if isinstance(expression, ast.Name):
+            if expression.id in CONTROL_BOUNDARY_NAMES:
+                return {("boundary", expression.id)}
             if expression.id in resolving:
                 return set()
             if expression.id in aliases:
                 resolving.add(expression.id)
                 return resolve_callable(
-                    aliases[expression.id], aliases, class_name, resolving)
+                    aliases[expression.id], aliases, class_name, functions,
+                    resolving)
+            if expression.id in functions:
+                return {local_key(functions[expression.id])}
             if expression.id in module_functions:
                 return {("module", expression.id)}
             return set()
@@ -119,7 +160,8 @@ def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
             if expression.attr in aliases:
                 resolving.add(expression.attr)
                 return resolve_callable(
-                    aliases[expression.attr], aliases, class_name, resolving)
+                    aliases[expression.attr], aliases, class_name, functions,
+                    resolving)
             if expression.attr in class_methods.get(class_name, {}):
                 return {("class", class_name, expression.attr)}
             return set()
@@ -129,43 +171,84 @@ def rtsp_worker_control_calls(tree, worker_class_name, worker_method_name):
             return {("class", target_class, expression.attr)}
         return set()
 
-    node_by_key = {
-        ("module", name): node for name, node in module_functions.items()
-    }
-    node_by_key.update({
-        ("class", class_name, method_name): node
-        for class_name, methods in class_methods.items()
-        for method_name, node in methods.items()
-    })
-    pending = [("class", worker_class_name, worker_method_name)]
+    def expression_is_uart(expression, aliases, uart_names, resolving=None):
+        if resolving is None:
+            resolving = set()
+        if isinstance(expression, ast.Name):
+            if expression.id in uart_names or expression.id in UART_OBJECT_NAMES:
+                return True
+            if expression.id in resolving or expression.id not in aliases:
+                return False
+            resolving.add(expression.id)
+            return expression_is_uart(
+                aliases[expression.id], aliases, uart_names, resolving)
+        return (
+            isinstance(expression, ast.Attribute)
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id == "self"
+            and expression.attr in UART_OBJECT_NAMES)
+
+    def lexical_calls(statements):
+        def walk(node):
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Lambda)):
+                return
+            if isinstance(node, ast.Call):
+                yield node
+            for child in ast.iter_child_nodes(node):
+                yield from walk(child)
+
+        for statement in statements:
+            yield from walk(statement)
+
+    def passed_uart_names(call, callee, aliases, caller_uart_names):
+        parameter_names = function_params(callee)
+        uart_names = set(UART_OBJECT_NAMES).intersection(parameter_names)
+        for index, value in enumerate(call.args):
+            if (index < len(parameter_names)
+                    and expression_is_uart(
+                        value, aliases, caller_uart_names)):
+                uart_names.add(parameter_names[index])
+        for keyword in call.keywords:
+            if (keyword.arg in parameter_names
+                    and expression_is_uart(
+                        keyword.value, aliases, caller_uart_names)):
+                uart_names.add(keyword.arg)
+        return uart_names
+
+    pending = [(("class", worker_class_name, worker_method_name),
+                frozenset(UART_OBJECT_NAMES))]
     visited = set()
     control_calls = set()
     while pending:
-        node_key = pending.pop()
-        if node_key in visited:
+        node_key, uart_names = pending.pop()
+        visit_key = (node_key, uart_names)
+        if visit_key in visited:
             continue
-        visited.add(node_key)
+        visited.add(visit_key)
         node = node_by_key[node_key]
         class_name = node_key[1] if node_key[0] == "class" else None
         aliases = dict(module_aliases)
         aliases.update(class_aliases.get(class_name, {}))
-        aliases.update(aliases_in([node]))
-        for call in (
-                item for item in ast.walk(node) if isinstance(item, ast.Call)):
+        aliases.update(aliases_in(node.body))
+        functions = local_functions(node)
+        for call in lexical_calls(node.body):
             if isinstance(call.func, ast.Name):
                 if call.func.id in CONTROL_BOUNDARY_NAMES:
                     control_calls.add(call.func.id)
             elif (isinstance(call.func, ast.Attribute)
                   and call.func.attr == "write"
-                  and ((isinstance(call.func.value, ast.Name)
-                        and call.func.value.id in UART_OBJECT_NAMES)
-                       or (isinstance(call.func.value, ast.Attribute)
-                           and isinstance(call.func.value.value, ast.Name)
-                           and call.func.value.value.id == "self"
-                           and call.func.value.attr in UART_OBJECT_NAMES))):
+                  and expression_is_uart(
+                      call.func.value, aliases, uart_names)):
                 control_calls.add("uart.write")
-            pending.extend(resolve_callable(
-                call.func, aliases, class_name))
+            for target in resolve_callable(
+                    call.func, aliases, class_name, functions):
+                if target[0] == "boundary":
+                    control_calls.add(target[1])
+                    continue
+                pending.append((
+                    target,
+                    frozenset(passed_uart_names(
+                        call, node_by_key[target], aliases, uart_names))))
     return control_calls
 
 
@@ -980,6 +1063,85 @@ class Worker:
         tree, "Worker", "_stream_loop") == set()
 
 
+def test_rtsp_call_graph_detects_direct_boundary_alias():
+    tree = ast.parse(
+        """
+callback = publish_measurement
+
+class Worker:
+    def _stream_loop(self):
+        callback(1, 2, "blob", 3)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"publish_measurement"}
+
+
+def test_rtsp_call_graph_tracks_uart_argument_provenance():
+    tree = ast.parse(
+        """
+def write_port(port):
+    port.write(b"X:+001,Y:+002\\n")
+
+class Worker:
+    def _stream_loop(self, uart):
+        write_port(port=uart)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"uart.write"}
+
+
+def test_rtsp_call_graph_tracks_positional_uart_provenance():
+    tree = ast.parse(
+        """
+def write_port(port):
+    port.write(b"X:+001,Y:+002\\n")
+
+class Worker:
+    def _stream_loop(self, uart):
+        write_port(uart)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == {"uart.write"}
+
+
+def test_rtsp_call_graph_keeps_network_argument_provenance_allowed():
+    tree = ast.parse(
+        """
+def write_port(port):
+    port.write(b"video")
+
+class Worker:
+    def _stream_loop(self, client):
+        write_port(client)
+""")
+    assert rtsp_worker_control_calls(
+        tree, "Worker", "_stream_loop") == set()
+
+
+def test_rtsp_call_graph_respects_nested_function_scope_and_invocation():
+    not_called_tree = ast.parse(
+        """
+class Worker:
+    def _stream_loop(self):
+        def hidden_control():
+            publish_measurement(1, 2, "blob", 3)
+        return None
+""")
+    assert rtsp_worker_control_calls(
+        not_called_tree, "Worker", "_stream_loop") == set()
+
+    called_tree = ast.parse(
+        """
+class Worker:
+    def _stream_loop(self):
+        def hidden_control():
+            publish_measurement(1, 2, "blob", 3)
+        hidden_control()
+""")
+    assert rtsp_worker_control_calls(
+        called_tree, "Worker", "_stream_loop") == {"publish_measurement"}
+
+
 def test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting():
     assignments = {
         target.id: ast.literal_eval(item.value)
@@ -1174,6 +1336,11 @@ if __name__ == "__main__":
     test_rtsp_worker_isolated_from_control_outputs_and_startup_is_guarded()
     test_rtsp_call_graph_detects_module_alias_and_uart_wrappers()
     test_rtsp_call_graph_allows_network_writer()
+    test_rtsp_call_graph_detects_direct_boundary_alias()
+    test_rtsp_call_graph_tracks_uart_argument_provenance()
+    test_rtsp_call_graph_tracks_positional_uart_provenance()
+    test_rtsp_call_graph_keeps_network_argument_provenance_allowed()
+    test_rtsp_call_graph_respects_nested_function_scope_and_invocation()
     test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting()
     test_tracking_metrics_report_uses_exact_cadence_and_resets_window()
     test_tracking_metrics_report_guards_empty_averages_and_uses_ticks_diff()
