@@ -275,7 +275,7 @@ def compute_stepper_command(
         "direction": 0,
         "motion_sign": 0,
         "estimated_angle_deg": estimated_angle,
-        "target_angle_deg": 0.0,
+        "target_angle_deg": float(state.get("target_angle_deg", 0.0)),
         "last_update_ms": now_ms,
         "fault": "none",
     }
@@ -283,7 +283,9 @@ def compute_stepper_command(
         result["fault"] = "not_zeroed"
         return result
     if not measurement_valid:
-        result["fault"] = "vision_invalid"
+        # Stop STEP pulses but keep EN active so the rod holds its last angle
+        # while an edge-positioned ball is temporarily outside vision.
+        result["fault"] = "vision_hold"
         return result
 
     if abs(error_cm) <= deadband_cm:

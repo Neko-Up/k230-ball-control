@@ -108,10 +108,20 @@ def test_inward_motion_at_angle_limit_is_allowed():
 
 
 def test_invalid_or_unzeroed_state_disables_motor():
-    assert command(measurement_valid=False)["fault"] == "vision_invalid"
+    lost = command(measurement_valid=False)
+    assert lost["fault"] == "vision_hold"
+    assert lost["target_angle_deg"] == 0.0
     assert command(zeroed=False)["fault"] == "not_zeroed"
-    assert command(measurement_valid=False)["enabled"] is False
+    assert lost["enabled"] is False
     assert command(zeroed=False)["enabled"] is False
+
+
+def test_vision_loss_preserves_last_target_angle_for_holding_torque():
+    state = base_state()
+    state["target_angle_deg"] = -1.4
+    result = command(state=state, measurement_valid=False)
+    assert result["fault"] == "vision_hold"
+    assert result["target_angle_deg"] == -1.4
 
 
 def test_direction_inversion_only_changes_physical_direction():

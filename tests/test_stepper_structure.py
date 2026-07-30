@@ -64,6 +64,8 @@ def test_d36a_adapter_owns_pwm_direction_and_active_high_enable():
     assert ".enable(" not in apply_text
     assert "self.last_direction" in apply_text
     assert "self.pwm.duty(50)" in apply_text
+    assert "vision_hold" not in apply_text.split("disable =", 1)[1].split(
+        "self.stop", 1)[0]
     assert "self.watchdog.init" in apply_text
     assert "except Exception" in apply_text
     assert "self.stop(disable=True, cancel_watchdog=False)" in apply_text
