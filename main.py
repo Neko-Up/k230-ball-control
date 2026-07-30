@@ -98,6 +98,7 @@ MERGED_CLASS_ID          = 0       # 新模型只有 gangqiu 一个类
 MIN_BOX_SIZE             = 4
 MAX_BOX_SIZE             = 170
 MAX_ASPECT_RATIO         = 1.8
+AI_ROD_ROI               = (0, 110, 640, 140)
 DEDUP_IOU_THRESHOLD      = 0.35
 DEDUP_CENTER_RATIO       = 0.55
 TRACK_MERGE_IOU_THRESHOLD = 0.25
@@ -106,6 +107,8 @@ PREDICTION_HORIZON_MS     = 35
 PREDICTION_MIN_MS         = 20
 PREDICTION_MAX_MS         = 40
 PREDICTION_MAX_SHIFT_PX   = 16
+MOTION_RESET_JUMP_PX      = 48
+VELOCITY_REVERSAL_MIN_SPEED = 0.01
 BLOB_THRESHOLDS           = [(0, 70, -20, 20, -20, 20)]
 BLOB_GLOBAL_ROI           = (0, 110, 640, 140)
 BLOB_ROI_HALF_WIDTH       = 96
@@ -177,14 +180,17 @@ prediction_clamp_count = 0
 # 工具函数
 # ============================================================
 
-def estimate_velocity(samples):
+def estimate_velocity(samples, ticks_diff_fn=None):
     if len(samples) < 2:
         return 0.0, 0.0
     velocities = []
     for index in range(1, len(samples)):
         x0, y0, t0 = samples[index - 1]
         x1, y1, t1 = samples[index]
-        dt = t1 - t0
+        if ticks_diff_fn is None:
+            dt = t1 - t0
+        else:
+            dt = ticks_diff_fn(t1, t0)
         if dt > 0:
             velocities.append(((x1 - x0) / dt, (y1 - y0) / dt))
     if not velocities:
@@ -193,6 +199,49 @@ def estimate_velocity(samples):
         sum(item[0] for item in velocities) / len(velocities),
         sum(item[1] for item in velocities) / len(velocities),
     )
+
+
+def is_velocity_reversal(previous_vx, previous_vy, next_vx, next_vy):
+    min_speed_sq = (
+        VELOCITY_REVERSAL_MIN_SPEED * VELOCITY_REVERSAL_MIN_SPEED)
+    previous_speed_sq = previous_vx * previous_vx + previous_vy * previous_vy
+    next_speed_sq = next_vx * next_vx + next_vy * next_vy
+    if previous_speed_sq < min_speed_sq or next_speed_sq < min_speed_sq:
+        return False
+    return previous_vx * next_vx + previous_vy * next_vy < 0
+
+
+def update_motion_history(samples, x, y, now_ms,
+                          ticks_diff_fn=None, jump_threshold=None):
+    if jump_threshold is None:
+        jump_threshold = MOTION_RESET_JUMP_PX
+    history = list(samples)
+    reset_velocity = False
+    if history:
+        previous_x, previous_y, previous_ms = history[-1]
+        delta_x = x - previous_x
+        delta_y = y - previous_y
+        if (delta_x * delta_x + delta_y * delta_y >
+                jump_threshold * jump_threshold):
+            reset_velocity = True
+        else:
+            if ticks_diff_fn is None:
+                elapsed_ms = now_ms - previous_ms
+            else:
+                elapsed_ms = ticks_diff_fn(now_ms, previous_ms)
+            if elapsed_ms > 0 and len(history) >= 2:
+                previous_vx, previous_vy = estimate_velocity(
+                    history, ticks_diff_fn)
+                next_vx = delta_x / elapsed_ms
+                next_vy = delta_y / elapsed_ms
+                reset_velocity = is_velocity_reversal(
+                    previous_vx, previous_vy, next_vx, next_vy)
+    current_sample = (x, y, now_ms)
+    if reset_velocity:
+        return [current_sample], 0.0, 0.0, True
+    history = (history + [current_sample])[-3:]
+    vx, vy = estimate_velocity(history, ticks_diff_fn)
+    return history, vx, vy, False
 
 
 def predict_position(x, y, vx, vy, horizon_ms, max_shift_px):
@@ -240,10 +289,31 @@ def kpu_validation_outcome(published_control, blob_x, blob_y,
     return published_control, False, ai_failures + 1
 
 
-def hybrid_frame_actions(state, frame_number, blob_available):
+def apply_kpu_validation_anchor(published_control, blob_x, blob_y,
+                                capture, motion_history,
+                                jump_threshold=None):
+    if not kpu_blob_identity_match(blob_x, blob_y, capture):
+        return published_control, None, motion_history
+    if jump_threshold is None:
+        jump_threshold = MOTION_RESET_JUMP_PX
+    delta_x = capture["cx"] - blob_x
+    delta_y = capture["cy"] - blob_y
+    if (delta_x * delta_x + delta_y * delta_y >
+            jump_threshold * jump_threshold):
+        motion_history = []
+    return (
+        published_control,
+        {"x": capture["cx"], "y": capture["cy"]},
+        motion_history,
+    )
+
+
+def hybrid_frame_actions(state, frame_number, blob_available, blob_valid=True):
     if not blob_available:
         return ("kpu",)
     if state != TRACK_ACTIVE:
+        return ("kpu",)
+    if not blob_valid:
         return ("kpu",)
     if frame_number % AI_VALIDATE_INTERVAL == 0:
         return ("blob_control", "kpu")
@@ -270,8 +340,9 @@ def prediction_for_missed_frame(current_state, predicted_frames, now_ms):
 
 def publish_measurement(x, y, source, now_ms):
     global control_state, motion_samples, prediction_clamp_count
-    motion_samples = (motion_samples + [(x, y, now_ms)])[-3:]
-    vx, vy = estimate_velocity(motion_samples)
+    motion_samples, vx, vy, _ = update_motion_history(
+        motion_samples, x, y, now_ms,
+        time.ticks_diff, MOTION_RESET_JUMP_PX)
     pred_x, pred_y, clamped = predict_position(
         x, y, vx, vy, PREDICTION_HORIZON_MS, PREDICTION_MAX_SHIFT_PX)
     if clamped:
@@ -307,6 +378,10 @@ def tracking_metrics_report(
             blob_losses, kpu_reacquires, prediction_clamps),
         now_ms, 0, 0, 0, 0, 0, 0, 0,
     )
+
+
+def reset_tracking_metrics_window(now_ms):
+    return now_ms, 0, 0, 0, 0, 0, 0, 0
 
 
 def invalidate_control_state():
@@ -367,6 +442,8 @@ def detect_blob_measurement(img, dynamic_roi,
 
 def snapshot_blob_channel(sensor, should_detect, dynamic_roi,
                           expected_x, expected_y):
+    if not should_detect:
+        return None, True
     blob_img = None
     try:
         blob_img = sensor.snapshot(chn=CAM_CHN_ID_1, timeout=2000)
@@ -379,6 +456,10 @@ def snapshot_blob_channel(sensor, should_detect, dynamic_roi,
         return None, False
     finally:
         del blob_img
+
+
+def should_snapshot_blob_channel(state, blob_available):
+    return blob_available and state == TRACK_ACTIVE
 
 
 def blob_tracking_roi(expected_x):
@@ -451,6 +532,39 @@ def cleanup_camera_start(sensor, display_started, media_attempted):
             MediaManager.deinit()
         except BaseException:
             pass
+
+
+def cleanup_runtime_resources(rtsp_server, sensor, tensor_holder):
+    try:
+        if rtsp_server is not None and rtsp_server.running:
+            rtsp_server.stop()
+    except BaseException:
+        pass
+    try:
+        if sensor is not None:
+            sensor.stop()
+    except BaseException:
+        pass
+    try:
+        Display.deinit()
+    except BaseException:
+        pass
+    try:
+        MediaManager.deinit()
+    except BaseException:
+        pass
+    try:
+        tensor_holder[0] = None
+    except BaseException:
+        pass
+    try:
+        gc.collect()
+    except BaseException:
+        pass
+    try:
+        nn.shrink_memory_pool()
+    except BaseException:
+        pass
 
 
 def start_camera_pipeline(enable_blob_channel):
@@ -627,11 +741,17 @@ def select_best_ai_ball(det_boxes):
             continue
         if max(width, height) / min(width, height) > MAX_ASPECT_RATIO:
             continue
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        roi_x, roi_y, roi_width, roi_height = AI_ROD_ROI
+        if (center_x < roi_x or center_x >= roi_x + roi_width or
+                center_y < roi_y or center_y >= roi_y + roi_height):
+            continue
         if best_capture is None or score > best_capture["score"]:
             best_capture = {
                 "box": [x1, y1, x2, y2],
-                "cx": int((x1 + x2) / 2),
-                "cy": int((y1 + y2) / 2),
+                "cx": int(center_x),
+                "cy": int(center_y),
                 "score": score,
             }
     return best_capture
@@ -1337,44 +1457,52 @@ def detection():
     # ---- 摄像头 ----
     # 部分 K230 板型默认以 60 FPS 启动；显示和 AI 同时工作时
     # 会导致 snapshot chn(2) failed(3)。固定 30 FPS 可避免缓冲区耗尽。
-    time.sleep_ms(CAMERA_BOOT_DELAY_MS)
-    sensor, osd_img, rtsp_server, blob_channel_available = (
-        start_camera_with_blob_fallback(start_camera_pipeline))
-
-    print("Creating AI output tensor")
-    data = np.ones((1,3,kmodel_frame_size[1],kmodel_frame_size[0]), dtype=np.uint8)
-    ai2d_output_tensor = nn.from_numpy(data)
-    first_ai_frame = True
-    wlan = None
-    gc_frame_count = 0
-    perf_frame_count = 0
-    perf_start_ms = time.ticks_ms()
-    metrics_start_ms = time.ticks_ms()
-    blob_frame_count = 0
-    blob_total_ms = 0
-    kpu_validation_count = 0
-    kpu_total_ms = 0
-    blob_loss_count = 0
-    kpu_reacquire_count = 0
-    prediction_clamp_count = 0
-    blob_misses = 0
-    ai_failures = 0
-    predicted_frames = 0
-    tracker_state = TRACK_SEARCH
-    print("AI loop start")
-
+    sensor = None
+    rtsp_server = None
+    ai2d_output_tensor = None
+    tensor_holder = [None]
     try:
+        time.sleep_ms(CAMERA_BOOT_DELAY_MS)
+        sensor, osd_img, rtsp_server, blob_channel_available = (
+            start_camera_with_blob_fallback(start_camera_pipeline))
+
+        print("Creating AI output tensor")
+        data = np.ones(
+            (1,3,kmodel_frame_size[1],kmodel_frame_size[0]), dtype=np.uint8)
+        ai2d_output_tensor = nn.from_numpy(data)
+        tensor_holder[0] = ai2d_output_tensor
+        first_ai_frame = True
+        wlan = None
+        gc_frame_count = 0
+        perf_frame_count = 0
+        perf_start_ms = time.ticks_ms()
+        metrics_start_ms = time.ticks_ms()
+        blob_frame_count = 0
+        blob_total_ms = 0
+        kpu_validation_count = 0
+        kpu_total_ms = 0
+        blob_loss_count = 0
+        kpu_reacquire_count = 0
+        prediction_clamp_count = 0
+        blob_misses = 0
+        ai_failures = 0
+        predicted_frames = 0
+        tracker_state = TRACK_SEARCH
+        roi_anchor = {"x": control_state["x"], "y": control_state["y"]}
+        print("AI loop start")
+
         while True:
             with ScopedTiming("total", debug_mode > 0):
-                dynamic_roi = blob_tracking_roi(control_state["x"])
+                dynamic_roi = blob_tracking_roi(roi_anchor["x"])
                 blob_capture = None
-                if blob_channel_available:
+                if should_snapshot_blob_channel(
+                        tracker_state, blob_channel_available):
                     blob_start_ms = time.ticks_ms()
                     blob_capture, blob_channel_available = (
                         snapshot_blob_channel(
-                            sensor, tracker_state == TRACK_ACTIVE,
+                            sensor, True,
                             dynamic_roi,
-                            control_state["x"], control_state["y"]))
+                            roi_anchor["x"], roi_anchor["y"]))
                     blob_frame_count += 1
                     blob_total_ms += time.ticks_diff(
                         time.ticks_ms(), blob_start_ms)
@@ -1385,10 +1513,14 @@ def detection():
                         predicted_frames = 0
                         motion_samples = []
 
+                blob_valid = blob_capture is not None
+                if (blob_channel_available and
+                        tracker_state == TRACK_ACTIVE and not blob_valid):
+                    blob_loss_count += 1
+                    blob_misses += 1
                 actions = hybrid_frame_actions(
                     tracker_state, frame_counter + 1,
-                    blob_channel_available)
-                blob_valid = False
+                    blob_channel_available, blob_valid)
                 blob_measurement_x = None
                 blob_measurement_y = None
                 ai_valid = False
@@ -1402,25 +1534,16 @@ def detection():
                             blob_measurement_y = blob_y
                             publish_measurement(
                                 blob_x, blob_y, "blob", time.ticks_ms())
-                            blob_valid = True
+                            roi_anchor = {
+                                "x": control_state["x"],
+                                "y": control_state["y"],
+                            }
                             blob_misses = 0
                             predicted_frames = 0
-                        else:
-                            blob_loss_count += 1
-                            blob_misses += 1
-                            predicted_state, predicted_frames = (
-                                prediction_for_missed_frame(
-                                    control_state, predicted_frames,
-                                    time.ticks_ms()))
-                            if predicted_state is None:
-                                invalidate_control_state()
-                            else:
-                                control_state = predicted_state
-
-                        # Blob/prediction control is committed before a
-                        # validation KPU action later in this same tuple.
-                        publish_control_outputs(
-                            osd_img, None, color_four, uart)
+                            # Blob control stays first on scheduled KPU
+                            # validation frames and is published only once.
+                            publish_control_outputs(
+                                osd_img, None, color_four, uart)
                         continue
 
                     capture = None
@@ -1433,7 +1556,7 @@ def detection():
                     det_boxes = None
                     is_kpu_validation = (
                         blob_channel_available and
-                        tracker_state == TRACK_ACTIVE)
+                        tracker_state == TRACK_ACTIVE and blob_valid)
                     try:
                         rgb888p_img = sensor.snapshot(
                             chn=CAM_CHN_ID_2, timeout=2000)
@@ -1450,6 +1573,13 @@ def detection():
                                     rtsp_server.start(wlan.ifconfig()[0])
                                 except BaseException as e:
                                     print("RTSP disabled after initialization failure:", e)
+                            (metrics_start_ms,
+                             blob_frame_count, blob_total_ms,
+                             kpu_validation_count, kpu_total_ms,
+                             blob_loss_count, kpu_reacquire_count,
+                             prediction_clamp_count) = (
+                                reset_tracking_metrics_window(
+                                    time.ticks_ms()))
 
                         if rgb888p_img.format() == image.RGBP888:
                             if is_kpu_validation:
@@ -1493,46 +1623,48 @@ def detection():
                         del rgb888p_img
 
                     ai_valid = capture is not None
-                    if ai_valid and tracker_state == TRACK_RECOVER:
+                    if (ai_valid and
+                            (tracker_state == TRACK_RECOVER or
+                             (tracker_state == TRACK_ACTIVE and
+                              not blob_valid))):
                         kpu_reacquire_count += 1
-                    validation_only = (
-                        blob_channel_available and
-                        tracker_state == TRACK_ACTIVE)
+                    validation_only = is_kpu_validation
                     if validation_only:
-                        if blob_valid:
-                            control_state, ai_valid, ai_failures = (
-                                kpu_validation_outcome(
-                                    control_state,
-                                    blob_measurement_x, blob_measurement_y,
-                                    capture, ai_failures))
-                            if ai_valid:
-                                blob_misses, _, predicted_frames = (
-                                    ai_capture_counters(
-                                        tracker_state, blob_valid,
-                                        blob_misses))
-                        elif ai_valid:
-                            blob_misses, ai_failures, predicted_frames = (
-                                ai_capture_counters(
-                                    tracker_state, blob_valid, blob_misses))
-                            motion_samples = []
-                            publish_measurement(
-                                capture["cx"], capture["cy"],
-                                "kpu", time.ticks_ms())
-                        else:
-                            ai_failures += 1
+                        control_state, ai_valid, ai_failures = (
+                            kpu_validation_outcome(
+                                control_state,
+                                blob_measurement_x, blob_measurement_y,
+                                capture, ai_failures))
+                        if ai_valid:
+                            (control_state, corrected_anchor,
+                             motion_samples) = apply_kpu_validation_anchor(
+                                control_state,
+                                blob_measurement_x, blob_measurement_y,
+                                capture, motion_samples,
+                                MOTION_RESET_JUMP_PX)
+                            if corrected_anchor is not None:
+                                roi_anchor = corrected_anchor
+                            (blob_misses, ai_failures,
+                             predicted_frames) = ai_capture_counters(
+                                tracker_state, blob_valid, blob_misses)
                     else:
                         if ai_valid:
-                            if (blob_channel_available and
-                                    tracker_state != TRACK_ACTIVE):
+                            if (tracker_state != TRACK_ACTIVE or
+                                    not blob_valid):
                                 motion_samples = []
                             publish_measurement(
                                 capture["cx"], capture["cy"],
                                 "kpu", time.ticks_ms())
+                            roi_anchor = {
+                                "x": capture["cx"], "y": capture["cy"],
+                            }
                             blob_misses, ai_failures, predicted_frames = (
                                 ai_capture_counters(
                                     tracker_state, blob_valid, blob_misses))
                         elif (blob_channel_available and
-                              tracker_state == TRACK_RECOVER):
+                              tracker_state in (
+                                  TRACK_ACTIVE, TRACK_RECOVER)):
+                            ai_failures += 1
                             predicted_state, predicted_frames = (
                                 prediction_for_missed_frame(
                                     control_state, predicted_frames,
@@ -1541,6 +1673,10 @@ def detection():
                                 invalidate_control_state()
                             else:
                                 control_state = predicted_state
+                                roi_anchor = {
+                                    "x": control_state["x"],
+                                    "y": control_state["y"],
+                                }
                         else:
                             invalidate_control_state()
 
@@ -1593,15 +1729,9 @@ def detection():
     except BaseException as e:
         print("=== Runtime error ===", e)
         raise
-
-    if rtsp_server.running:
-        rtsp_server.stop()
-    sensor.stop()
-    Display.deinit()
-    MediaManager.deinit()
-    del ai2d_output_tensor
-    gc.collect()
-    nn.shrink_memory_pool()
+    finally:
+        ai2d_output_tensor = None
+        cleanup_runtime_resources(rtsp_server, sensor, tensor_holder)
     return 0
 
 

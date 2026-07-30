@@ -11,14 +11,15 @@ PURE_CONSTANTS = {
     for target in item.targets
     if isinstance(target, ast.Name)
     and target.id in {
-        "MIN_BOX_SIZE", "MAX_BOX_SIZE", "MAX_ASPECT_RATIO",
+        "MIN_BOX_SIZE", "MAX_BOX_SIZE", "MAX_ASPECT_RATIO", "AI_ROD_ROI",
         "BLOB_THRESHOLDS", "BLOB_GLOBAL_ROI", "BLOB_ROI_HALF_WIDTH",
         "BLOB_MIN_PIXELS", "BLOB_MAX_PIXELS", "BLOB_MAX_ASPECT_RATIO",
         "BLOB_MAX_CENTER_DISTANCE",
         "TRACK_SEARCH", "TRACK_ACTIVE", "TRACK_RECOVER",
         "AI_VALIDATE_INTERVAL", "BLOB_LOST_TO_RECOVER",
         "AI_FAILURES_TO_RECOVER", "AI_BLOB_IDENTITY_MAX_DISTANCE",
-        "METRICS_EVERY_N_CONTROL_FRAMES",
+        "METRICS_EVERY_N_CONTROL_FRAMES", "MOTION_RESET_JUMP_PX",
+        "VELOCITY_REVERSAL_MIN_SPEED",
     }
 }
 
@@ -693,6 +694,23 @@ def test_single_ai_capture_selects_highest_valid_confidence():
     assert result["score"] == 0.90
 
 
+def test_single_ai_capture_prefers_in_rod_roi_over_higher_confidence_off_rod():
+    select_best_ai_ball = load_pure_function("select_best_ai_ball")
+    detections = [
+        [0, 0.99, 100, 20, 130, 50],
+        [0, 0.65, 120, 150, 150, 180],
+    ]
+
+    result = select_best_ai_ball(detections)
+
+    assert result == {
+        "box": [120.0, 150.0, 150.0, 180.0],
+        "cx": 135,
+        "cy": 165,
+        "score": 0.65,
+    }
+
+
 def test_single_ai_capture_rejects_invalid_configured_boxes():
     select_best_ai_ball = load_pure_function(
         "select_best_ai_ball",
@@ -838,6 +856,62 @@ def test_distant_kpu_capture_fails_without_overwriting_blob_control():
     assert transition("TRACK", True, valid, 0, failures) == "RECOVER"
 
 
+def test_blob_first_kpu_validation_sets_the_next_frame_roi_anchor():
+    identity_match = load_pure_function("kpu_blob_identity_match")
+    validation_anchor = load_pure_function(
+        "apply_kpu_validation_anchor",
+        {"kpu_blob_identity_match": identity_match},
+    )
+    blob_tracking_roi = load_pure_function("blob_tracking_roi")
+    published_control = {
+        "x": 108, "y": 120, "vx": 0.2, "vy": 0.0,
+        "valid": True, "source": "blob", "timestamp_ms": 50,
+    }
+    history = [(90, 120, 10), (100, 120, 30)]
+
+    returned, anchor, returned_history = validation_anchor(
+        published_control, 100, 120, {"cx": 130, "cy": 120},
+        history, 48)
+
+    assert returned is published_control
+    assert returned["source"] == "blob"
+    assert anchor == {"x": 130, "y": 120}
+    assert blob_tracking_roi(anchor["x"]) == (34, 110, 192, 140)
+    assert returned_history is history
+
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    assert any(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "apply_kpu_validation_anchor"
+        for call in ast.walk(detection)
+    )
+
+
+def test_large_kpu_anchor_correction_clears_motion_history():
+    identity_match = load_pure_function("kpu_blob_identity_match")
+    validation_anchor = load_pure_function(
+        "apply_kpu_validation_anchor",
+        {"kpu_blob_identity_match": identity_match},
+    )
+    published_control = {
+        "x": 108, "y": 120, "vx": 0.2, "vy": 0.0,
+        "valid": True, "source": "blob", "timestamp_ms": 50,
+    }
+
+    returned, anchor, history = validation_anchor(
+        published_control, 100, 120, {"cx": 160, "cy": 120},
+        [(90, 120, 10), (100, 120, 30)], 48)
+
+    assert returned is published_control
+    assert anchor == {"x": 160, "y": 120}
+    assert history == []
+
+
 def test_hybrid_schedule_is_control_first_with_six_frame_validation():
     schedule = load_pure_function("hybrid_frame_actions")
     assert PURE_CONSTANTS["AI_VALIDATE_INTERVAL"] == 6
@@ -849,6 +923,88 @@ def test_hybrid_schedule_is_control_first_with_six_frame_validation():
     assert schedule("SEARCH", 5, True) == ("kpu",)
     assert schedule("RECOVER", 5, True) == ("kpu",)
     assert schedule("TRACK", 5, False) == ("kpu",)
+
+
+def test_track_blob_miss_runs_same_frame_kpu_before_any_control_output():
+    schedule_node = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "hybrid_frame_actions"
+    )
+    assert [arg.arg for arg in schedule_node.args.args] == [
+        "state", "frame_number", "blob_available", "blob_valid",
+    ]
+    schedule = load_pure_function("hybrid_frame_actions")
+    assert schedule("TRACK", 5, True, False) == ("kpu",)
+    assert schedule("TRACK", 6, True, False) == ("kpu",)
+
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    action_loop = next(
+        node
+        for node in ast.walk(detection)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Name)
+        and node.iter.id == "actions"
+    )
+    blob_branch = next(
+        node
+        for node in action_loop.body
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(name, ast.Constant) and name.value == "blob_control"
+            for name in ast.walk(node.test)
+        )
+    )
+    blob_valid_branch = next(
+        node
+        for node in blob_branch.body
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(name, ast.Name) and name.id == "blob_capture"
+            for name in ast.walk(node.test)
+        )
+    )
+    early_output_lines = {
+        call.lineno
+        for call in ast.walk(blob_branch)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "publish_control_outputs"
+    }
+    valid_output_lines = {
+        call.lineno
+        for statement in blob_valid_branch.body
+        for call in ast.walk(statement)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "publish_control_outputs"
+    }
+    kpu_run_lines = {
+        call.lineno
+        for call in ast.walk(action_loop)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "kpu"
+        and call.func.attr == "run"
+    }
+    later_output_lines = {
+        call.lineno
+        for call in ast.walk(action_loop)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "publish_control_outputs"
+        and any(run_line < call.lineno for run_line in kpu_run_lines)
+    }
+
+    assert early_output_lines == valid_output_lines
+    assert kpu_run_lines
+    assert later_output_lines
 
 
 def test_one_missed_blob_frame_is_predicted_then_requests_invalidation():
@@ -906,6 +1062,91 @@ def test_tracking_marker_uses_state_color_and_skips_invalid_control():
         (0, 0, 255, 255),
     ]
     assert all(circle[:3] == (120, 80, 12) for circle in img.circles)
+
+
+def test_invalid_control_never_draws_a_stale_tracking_circle():
+    draw_tracking_marker = load_pure_function(
+        "draw_tracking_marker",
+        {
+            "tracking_osd_color": lambda state: "green",
+            "ai_to_disp": lambda x, y: (x, y),
+        },
+    )
+
+    class Image:
+        def __init__(self):
+            self.circles = []
+
+        def draw_circle(self, *args, **kwargs):
+            self.circles.append((args, kwargs))
+
+    img = Image()
+    draw_tracking_marker(
+        img,
+        {"x": 555, "y": 222, "valid": False, "source": "predict"},
+        "RECOVER",
+    )
+    assert img.circles == []
+
+
+def test_channel_one_snapshot_is_track_only():
+    should_snapshot = load_pure_function("should_snapshot_blob_channel")
+    assert should_snapshot("SEARCH", True) is False
+    assert should_snapshot("RECOVER", True) is False
+    assert should_snapshot("TRACK", False) is False
+    assert should_snapshot("TRACK", True) is True
+
+    events = []
+
+    class Sensor:
+        def snapshot(self, **kwargs):
+            events.append(kwargs)
+            return object()
+
+    snapshot_blob_channel = load_pure_function(
+        "snapshot_blob_channel",
+        {
+            "CAM_CHN_ID_1": 1,
+            "detect_blob_measurement": lambda *args: None,
+            "print": lambda *args: None,
+        },
+    )
+    assert snapshot_blob_channel(
+        Sensor(), False, (0, 110, 192, 140), 100, 180) == (None, True)
+    assert events == []
+
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    snapshot_guards = [
+        node
+        for node in ast.walk(detection)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "should_snapshot_blob_channel"
+            for call in ast.walk(node.test)
+        )
+    ]
+    assert len(snapshot_guards) == 1
+    guarded_nodes = [
+        child for statement in snapshot_guards[0].body for child in ast.walk(statement)
+    ]
+    assert any(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "snapshot_blob_channel"
+        for call in guarded_nodes
+    )
+    assert any(
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "blob_frame_count"
+        for node in guarded_nodes
+    )
 
 
 def test_control_outputs_call_servo_hook_before_uart_osd_display():
@@ -1292,6 +1533,217 @@ def test_blob_setter_failure_releases_partial_sensor_before_fallback():
     sensor, _, _, blob_available = start_camera_with_blob_fallback(start_attempt)
     assert isinstance(sensor, LegacySensor)
     assert blob_available is False
+
+
+def test_runtime_cleanup_is_individually_guarded_and_preserves_primary_error():
+    events = []
+
+    class RtspServer:
+        running = True
+
+        def stop(self):
+            events.append("rtsp")
+            raise ValueError("rtsp cleanup failed")
+
+    class Sensor:
+        def stop(self):
+            events.append("sensor")
+            raise ValueError("sensor cleanup failed")
+
+    class Display:
+        @staticmethod
+        def deinit():
+            events.append("display")
+
+    class MediaManager:
+        @staticmethod
+        def deinit():
+            events.append("media")
+            raise ValueError("media cleanup failed")
+
+    class Gc:
+        @staticmethod
+        def collect():
+            events.append("gc")
+
+    class Nn:
+        @staticmethod
+        def shrink_memory_pool():
+            events.append("pool")
+
+    cleanup = load_pure_function(
+        "cleanup_runtime_resources",
+        {
+            "Display": Display,
+            "MediaManager": MediaManager,
+            "gc": Gc,
+            "nn": Nn,
+        },
+    )
+    tensor_holder = [object()]
+
+    try:
+        try:
+            raise RuntimeError("primary runtime failure")
+        finally:
+            cleanup(RtspServer(), Sensor(), tensor_holder)
+    except RuntimeError as error:
+        assert str(error) == "primary runtime failure"
+    else:
+        assert False, "cleanup swallowed the primary exception"
+
+    assert tensor_holder == [None]
+    assert events == ["rtsp", "sensor", "display", "media", "gc", "pool"]
+
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    finalizers = [
+        node
+        for node in ast.walk(detection)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "cleanup_runtime_resources"
+            for statement in node.finalbody
+            for call in ast.walk(statement)
+        )
+    ]
+    assert len(finalizers) == 1
+    protected_calls = [
+        call
+        for statement in finalizers[0].body
+        for call in ast.walk(statement)
+        if isinstance(call, ast.Call)
+    ]
+    assert any(
+        isinstance(call.func, ast.Name)
+        and call.func.id == "start_camera_with_blob_fallback"
+        for call in protected_calls
+    )
+    assert any(
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "nn"
+        and call.func.attr == "from_numpy"
+        for call in protected_calls
+    )
+    runtime_handlers = [
+        handler
+        for node in ast.walk(detection)
+        if isinstance(node, ast.Try)
+        for handler in node.handlers
+        if isinstance(handler.type, ast.Name)
+        and handler.type.id == "BaseException"
+    ]
+    assert any(
+        isinstance(statement, ast.Raise) and statement.exc is None
+        for handler in runtime_handlers
+        for statement in handler.body
+    )
+
+
+def load_motion_publisher(ticks_diff=None):
+    if ticks_diff is None:
+        ticks_diff = lambda now_ms, previous_ms: now_ms - previous_ms
+
+    class FakeTime:
+        pass
+
+    FakeTime.ticks_diff = staticmethod(ticks_diff)
+    estimate_velocity = load_pure_function("estimate_velocity")
+    is_velocity_reversal = load_pure_function("is_velocity_reversal")
+    update_motion_history = load_pure_function(
+        "update_motion_history",
+        {
+            "estimate_velocity": estimate_velocity,
+            "is_velocity_reversal": is_velocity_reversal,
+        },
+    )
+    predict_position = load_pure_function("predict_position")
+    return load_pure_function(
+        "publish_measurement",
+        {
+            "time": FakeTime,
+            "estimate_velocity": estimate_velocity,
+            "is_velocity_reversal": is_velocity_reversal,
+            "update_motion_history": update_motion_history,
+            "predict_position": predict_position,
+            "PREDICTION_HORIZON_MS": 35,
+            "PREDICTION_MAX_SHIFT_PX": 16,
+            "MOTION_RESET_JUMP_PX": 48,
+            "motion_samples": [],
+            "control_state": {
+                "x": 0, "y": 0, "vx": 0.0, "vy": 0.0,
+                "valid": False, "source": "none", "timestamp_ms": 0,
+            },
+            "prediction_clamp_count": 0,
+        },
+    )
+
+
+def test_publish_measurement_keeps_only_the_latest_three_samples():
+    publish = load_motion_publisher()
+    for timestamp_ms, x in ((0, 0), (10, 5), (20, 10), (30, 15)):
+        publish(x, 20, "blob", timestamp_ms)
+
+    assert publish.__globals__["motion_samples"] == [
+        (5, 20, 10), (10, 20, 20), (15, 20, 30),
+    ]
+
+
+def test_publish_measurement_keeps_velocity_for_normal_motion():
+    publish = load_motion_publisher()
+    publish(100, 50, "blob", 0)
+    publish(104, 50, "blob", 20)
+    publish(110, 52, "blob", 40)
+
+    state = publish.__globals__["control_state"]
+    assert round(state["vx"], 3) == 0.25
+    assert round(state["vy"], 3) == 0.05
+    assert state["source"] == "blob"
+
+
+def test_publish_measurement_resets_velocity_on_true_reversal():
+    publish = load_motion_publisher()
+    publish(0, 20, "blob", 0)
+    publish(10, 20, "blob", 10)
+    publish(5, 20, "blob", 20)
+
+    state = publish.__globals__["control_state"]
+    assert publish.__globals__["motion_samples"] == [(5, 20, 20)]
+    assert (state["x"], state["y"], state["vx"], state["vy"]) == (
+        5, 20, 0.0, 0.0)
+
+
+def test_publish_measurement_resets_velocity_on_large_candidate_jump():
+    publish = load_motion_publisher()
+    publish(0, 20, "blob", 0)
+    publish(8, 20, "blob", 10)
+    publish(100, 20, "blob", 20)
+
+    state = publish.__globals__["control_state"]
+    assert publish.__globals__["motion_samples"] == [(100, 20, 20)]
+    assert (state["x"], state["y"], state["vx"], state["vy"]) == (
+        100, 20, 0.0, 0.0)
+
+
+def test_publish_measurement_uses_injected_wrap_safe_tick_differences():
+    def wrapped_ticks_diff(now_ms, previous_ms):
+        if now_ms >= previous_ms:
+            return now_ms - previous_ms
+        return now_ms + 256 - previous_ms
+
+    publish = load_motion_publisher(wrapped_ticks_diff)
+    publish(100, 50, "blob", 250)
+    publish(104, 50, "blob", 14)
+
+    state = publish.__globals__["control_state"]
+    assert round(state["vx"], 3) == 0.2
+    assert state["vy"] == 0.0
 
 
 def test_three_sample_velocity_and_bounded_prediction():
@@ -2007,6 +2459,61 @@ def test_tracking_metrics_report_guards_empty_averages_and_uses_ticks_diff():
     assert FakeTime.calls == [(3, 0xfffffff0)]
 
 
+def test_metrics_window_is_reset_after_one_time_network_startup():
+    reset_window = load_pure_function("reset_tracking_metrics_window")
+    assert reset_window(4321) == (4321, 0, 0, 0, 0, 0, 0, 0)
+
+    detection = next(
+        item
+        for item in TREE.body
+        if isinstance(item, ast.FunctionDef) and item.name == "detection"
+    )
+    first_ai_startup = next(
+        branch
+        for branch in ast.walk(detection)
+        if isinstance(branch, ast.If)
+        and isinstance(branch.test, ast.Name)
+        and branch.test.id == "first_ai_frame"
+    )
+    reset_assignments = [
+        node
+        for node in ast.walk(first_ai_startup)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "reset_tracking_metrics_window"
+    ]
+    assert len(reset_assignments) == 1
+    target_names = {
+        item.id
+        for target in reset_assignments[0].targets
+        if isinstance(target, (ast.Tuple, ast.List))
+        for item in target.elts
+        if isinstance(item, ast.Name)
+    }
+    assert target_names == {
+        "metrics_start_ms", "blob_frame_count", "blob_total_ms",
+        "kpu_validation_count", "kpu_total_ms", "blob_loss_count",
+        "kpu_reacquire_count", "prediction_clamp_count",
+    }
+    startup_lines = [
+        call.lineno
+        for call in ast.walk(first_ai_startup)
+        if isinstance(call, ast.Call)
+        and (
+            (isinstance(call.func, ast.Name) and call.func.id == "start_wifi")
+            or (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "start"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "rtsp_server"
+            )
+        )
+    ]
+    assert startup_lines
+    assert reset_assignments[0].lineno > max(startup_lines)
+
+
 def test_kpu_latency_metrics_only_measure_track_validation_processing():
     detection = next(
         item
@@ -2069,6 +2576,7 @@ def test_wifi_scan_supports_firmware_info_objects():
 if __name__ == "__main__":
     test_detection_circle_geometry()
     test_single_ai_capture_selects_highest_valid_confidence()
+    test_single_ai_capture_prefers_in_rod_roi_over_higher_confidence_off_rod()
     test_single_ai_capture_rejects_invalid_configured_boxes()
     test_blob_candidate_prefers_nearest_valid_ball()
     test_blob_detection_returns_plain_candidate_from_requested_roi()
@@ -2078,9 +2586,14 @@ if __name__ == "__main__":
     test_kpu_reacquisition_clears_blob_misses_before_returning_to_track()
     test_kpu_capture_within_blob_identity_gate_is_valid()
     test_distant_kpu_capture_fails_without_overwriting_blob_control()
+    test_blob_first_kpu_validation_sets_the_next_frame_roi_anchor()
+    test_large_kpu_anchor_correction_clears_motion_history()
     test_hybrid_schedule_is_control_first_with_six_frame_validation()
+    test_track_blob_miss_runs_same_frame_kpu_before_any_control_output()
     test_one_missed_blob_frame_is_predicted_then_requests_invalidation()
     test_tracking_marker_uses_state_color_and_skips_invalid_control()
+    test_invalid_control_never_draws_a_stale_tracking_circle()
+    test_channel_one_snapshot_is_track_only()
     test_control_outputs_call_servo_hook_before_uart_osd_display()
     test_kpu_frame_resources_are_released_before_blob_only_frames()
     test_validation_loop_commits_control_before_kpu_inference()
@@ -2088,6 +2601,12 @@ if __name__ == "__main__":
     test_blob_channel_does_not_swallow_keyboard_interrupt()
     test_blob_channel_is_best_effort_and_configured_before_media_init()
     test_blob_setter_failure_releases_partial_sensor_before_fallback()
+    test_runtime_cleanup_is_individually_guarded_and_preserves_primary_error()
+    test_publish_measurement_keeps_only_the_latest_three_samples()
+    test_publish_measurement_keeps_velocity_for_normal_motion()
+    test_publish_measurement_resets_velocity_on_true_reversal()
+    test_publish_measurement_resets_velocity_on_large_candidate_jump()
+    test_publish_measurement_uses_injected_wrap_safe_tick_differences()
     test_three_sample_velocity_and_bounded_prediction()
     test_osd_updates_at_the_requested_cadence()
     test_control_ui_is_full_rate_and_rtc_is_removed()
@@ -2121,6 +2640,7 @@ if __name__ == "__main__":
     test_low_rate_metrics_use_scalar_counters_and_interval_only_formatting()
     test_tracking_metrics_report_uses_exact_cadence_and_resets_window()
     test_tracking_metrics_report_guards_empty_averages_and_uses_ticks_diff()
+    test_metrics_window_is_reset_after_one_time_network_startup()
     test_kpu_latency_metrics_only_measure_track_validation_processing()
     test_wifi_scan_supports_firmware_info_objects()
     print("tests: OK")
