@@ -11,6 +11,7 @@ PURE_FUNCTIONS = {
     "project_point_to_pipe",
     "measure_pipe_position",
     "update_pipe_geometry_state",
+    "select_green_pipe_candidate",
 }
 
 
@@ -108,6 +109,24 @@ class GreenPipeGeometryTests(unittest.TestCase):
         self.assertTrue(state["locked"])
         locked = update(state, jittered, 2, 1.0, True)
         self.assertEqual(locked["geometry"]["center"], first["center"])
+
+    def test_pipe_candidate_rejects_large_sparse_search_box(self):
+        select = self.geometry["select_green_pipe_candidate"]
+        huge_sparse = {
+            "geometry": {"length_px": 520.0, "width_px": 115.0},
+            "pixels": 9000,
+        }
+        real_green_pipe = {
+            "geometry": {"length_px": 410.0, "width_px": 38.0},
+            "pixels": 12500,
+        }
+        selected = select(
+            [huge_sparse, real_green_pipe],
+            min_length_px=180.0,
+            min_aspect_ratio=3.0,
+            max_width_px=72.0,
+            min_fill_ratio=0.45)
+        self.assertIs(selected, real_green_pipe["geometry"])
 
 
 if __name__ == "__main__":

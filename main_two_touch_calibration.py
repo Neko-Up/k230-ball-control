@@ -123,6 +123,8 @@ PIPE_GLOBAL_ROI           = (0, 70, 640, 220)
 PIPE_MIN_PIXELS           = 1200
 PIPE_MIN_LENGTH_PX        = 180.0
 PIPE_MIN_ASPECT_RATIO     = 3.0
+PIPE_MAX_WIDTH_PX         = 72.0
+PIPE_MIN_FILL_RATIO       = 0.45
 PIPE_LENGTH_CM            = 25.0
 PIPE_HOLD_MISSES          = 3
 PIPE_SMOOTH_ALPHA         = 0.85
@@ -747,6 +749,33 @@ def green_pipe_geometry_from_blob(blob):
     return pipe_geometry_from_corners(corners)
 
 
+def select_green_pipe_candidate(candidates, min_length_px,
+                                min_aspect_ratio, max_width_px,
+                                min_fill_ratio):
+    best_geometry = None
+    best_score = None
+    for candidate in candidates:
+        geometry = candidate["geometry"]
+        if geometry is None:
+            continue
+        length_px = float(geometry["length_px"])
+        width_px = float(geometry["width_px"])
+        if length_px < min_length_px or width_px > max_width_px:
+            continue
+        aspect = length_px / max(1.0, width_px)
+        if aspect < min_aspect_ratio:
+            continue
+        fill_ratio = float(candidate["pixels"]) / max(
+            1.0, length_px * width_px)
+        if fill_ratio < min_fill_ratio:
+            continue
+        score = length_px * fill_ratio
+        if best_score is None or score > best_score:
+            best_geometry = geometry
+            best_score = score
+    return best_geometry
+
+
 def detect_green_pipe(img):
     blobs = img.find_blobs(
         PIPE_GREEN_THRESHOLDS,
@@ -755,24 +784,17 @@ def detect_green_pipe(img):
         y_stride=3,
         pixels_threshold=PIPE_MIN_PIXELS,
         area_threshold=PIPE_MIN_PIXELS,
-        merge=True,
-        margin=12)
-    best_geometry = None
-    best_score = None
+        merge=False)
+    candidates = []
     for blob in blobs:
         geometry = green_pipe_geometry_from_blob(blob)
-        if geometry is None:
-            continue
-        if geometry["length_px"] < PIPE_MIN_LENGTH_PX:
-            continue
-        aspect = geometry["length_px"] / max(1.0, geometry["width_px"])
-        if aspect < PIPE_MIN_ASPECT_RATIO:
-            continue
-        score = float(blob.pixels()) * aspect
-        if best_score is None or score > best_score:
-            best_geometry = geometry
-            best_score = score
-    return best_geometry
+        candidates.append({
+            "geometry": geometry,
+            "pixels": blob.pixels(),
+        })
+    return select_green_pipe_candidate(
+        candidates, PIPE_MIN_LENGTH_PX, PIPE_MIN_ASPECT_RATIO,
+        PIPE_MAX_WIDTH_PX, PIPE_MIN_FILL_RATIO)
 
 
 def snapshot_blob_channel(sensor, should_detect, dynamic_roi,
