@@ -212,6 +212,69 @@ prediction_clamp_count = 0
 # 工具函数
 # ============================================================
 
+def quadrature_delta(previous_state, current_state):
+    """Decode one AB transition; repeated/invalid transitions move by zero."""
+    transitions = (
+        0, 1, -1, 0,
+        -1, 0, 0, 1,
+        1, 0, 0, -1,
+        0, -1, 1, 0,
+    )
+    previous_state = int(previous_state) & 0x03
+    current_state = int(current_state) & 0x03
+    return transitions[(previous_state << 2) | current_state]
+
+
+def wrapped_encoder_delta(current, zero, counts_per_rev):
+    """Return the shortest signed circular distance from zero to current."""
+    counts_per_rev = int(counts_per_rev)
+    if counts_per_rev <= 0:
+        return 0
+    half_revolution = counts_per_rev // 2
+    return ((int(current) - int(zero) + half_revolution) %
+            counts_per_rev) - half_revolution
+
+
+def encoder_count_to_angle(delta, counts_per_rev):
+    counts_per_rev = int(counts_per_rev)
+    if counts_per_rev <= 0:
+        return 0.0
+    return float(delta) * 360.0 / counts_per_rev
+
+
+def pwm_duty_to_count(high_us, period_us, counts_per_rev,
+                      duty_min, duty_max, invert):
+    """Map a PWM absolute-duty sample into one encoder revolution."""
+    if period_us <= 0 or counts_per_rev <= 0 or duty_max <= duty_min:
+        return None
+    duty = float(high_us) / float(period_us)
+    if duty < duty_min or duty > duty_max:
+        return None
+    normalized = (duty - duty_min) / (duty_max - duty_min)
+    if invert:
+        normalized = 1.0 - normalized
+    count = int(round(normalized * counts_per_rev))
+    return max(0, min(int(counts_per_rev) - 1, count))
+
+
+def validate_encoder_calibration(data):
+    """Return a validated MS42CG v1 calibration, otherwise None."""
+    if not isinstance(data, dict):
+        return None
+    if (data.get("version") != 1 or
+            data.get("encoder_model") != "MS42CG" or
+            data.get("counts_per_rev") != 4096 or
+            type(data.get("zero_abs_count")) is not int or
+            not 0 <= data["zero_abs_count"] < 4096 or
+            type(data.get("pwm_invert")) is not bool):
+        return None
+    z_index_count = data.get("z_index_count")
+    if (z_index_count is not None and
+            (type(z_index_count) is not int or
+             not 0 <= z_index_count < 4096)):
+        return None
+    return dict(data)
+
 def estimate_velocity(samples, ticks_diff_fn=None):
     if len(samples) < 2:
         return 0.0, 0.0
