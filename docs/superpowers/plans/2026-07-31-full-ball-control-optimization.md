@@ -71,12 +71,13 @@
 **Interfaces:**
 - Produces `alpha_beta_update(state, position_cm, timestamp_ms, ...)` and `compute_outer_balance_target(error_cm, velocity_cm_s, dt_s, state, ...)` returning target angle plus updated integral state.
 
-- [ ] Add failing tests for real-time velocity estimation, reversal damping, bounded 0.3 degree bias integral, centre settling, smooth segmented angle limits, and edge recovery.
+- [ ] Add failing tests for real-time velocity estimation, reversal damping, bounded 0.3 degree bias integral, centre settling, smooth segmented angle limits, velocity-predicted soft-edge rejection, hard-edge inward rescue, and 200 ms edge-loss rescue.
 - [ ] Run the tests to verify failures are due to missing interfaces.
 - [ ] Implement alpha-beta position/velocity filtering with jump, velocity, and acceleration clamps.
 - [ ] Implement conditional anti-windup integral only inside 2 cm and below 5 cm/s.
 - [ ] Implement smooth gain scheduling: 0.3 degree near centre, 1 to 2 degrees mid-rail, and at most 5 degrees at the edge.
 - [ ] Apply target-angle slew limiting and reset integral on invalid vision or sign-inconsistent jumps.
+- [ ] Override outward commands inside the last 2.5 cm, force an inward rescue angle inside the last 1 cm, and retain the last reliable edge side for at most 200 ms after loss.
 - [ ] Run focused geometry and outer-controller tests until all pass.
 - [ ] Commit as `feat: stabilize centre return outer loop`.
 
@@ -88,13 +89,14 @@
 - Create: `tests/test_vision_scheduler.py`
 
 **Interfaces:**
-- Produces 320×320 AI/Blob coordinates, `should_validate_pipe(frame, locked)`, `ball_tracking_roi(x, y)`, and the existing KPU/Blob hybrid state machine with KPU validation every three frames.
+- Produces 320×320 AI/Blob coordinates, `should_validate_pipe(frame, locked)`, `ball_tracking_roi(x, y)`, `should_force_global_kpu(position_cm)`, and the existing KPU/Blob hybrid state machine with KPU validation every three frames.
 
 - [ ] Run the existing fast-vision tests as RED for 640×360 constants.
-- [ ] Add failing scheduler tests for five-frame startup rail lock, one-in-ten locked rail validation, bounded local ball ROI, and KPU cadence three.
+- [ ] Add failing scheduler tests for five-frame startup rail lock, one-in-ten locked rail validation, bounded local ball ROI, KPU cadence three, and mandatory every-frame global KPU validation in either edge zone.
 - [ ] Scale ROI, size, pixel-area, distance, prediction, and pipe geometry constants to 320×320.
 - [ ] Lock the rail only after five stable observations and validate it every ten frames thereafter.
 - [ ] Use a 96×96 local ROI when tracking is active and a 128×128 recovery ROI before returning to global KPU search.
+- [ ] Clamp prediction to the detected rail endpoints so a lost edge target cannot wrap or jump to the opposite side.
 - [ ] Keep LCD/VLC display dimensions and H.264 path unchanged.
 - [ ] Run focused vision tests until all pass.
 - [ ] Commit as `perf: accelerate hybrid vision pipeline`.
@@ -110,7 +112,7 @@
 **Interfaces:**
 - Produces `runtime_telemetry`, `compute_window_fps()`, `format_ball_telemetry()`, and a single ACTIVE startup path gated by valid PWM zero restore.
 
-- [ ] Add failing tests for P/BV/AI/CTRL display strings, 15-frame FPS window, removal of unreachable WAIT_CENTER prompts, and refusal to arm on session-only zero.
+- [ ] Add failing tests for P/BV/AI/CTRL display strings, EDGE WARN/EDGE RESCUE status, 15-frame FPS window, removal of unreachable WAIT_CENTER prompts, and refusal to arm on session-only zero.
 - [ ] Implement cached telemetry with OSD cadence 2 or 3 while UART/control remain per valid measurement.
 - [ ] Remove unreachable WAIT_CENTER transitions and misleading CENTER CONFIRM text.
 - [ ] Block ACTIVE until encoder PWM absolute zero is valid or a fresh valid LEVEL CONFIRM succeeds.
