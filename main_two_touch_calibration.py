@@ -190,14 +190,13 @@ STEPPER_EDGE_BOOST_DEG_PER_CM2 = 0.07
 STEPPER_ANGLE_TRACK_HZ_PER_DEG = 1200.0
 STEPPER_ANGLE_TOLERANCE_DEG = 0.03
 STEPPER_DEADBAND_CM = 0.15
-STEPPER_MIN_FREQUENCY_HZ = 80.0
+STEPPER_MIN_FREQUENCY_HZ = 220.0
 STEPPER_MAX_FREQUENCY_HZ = 800.0
-STEPPER_FREQUENCY_RAMP_HZ_S = 6000.0
+STEPPER_FREQUENCY_RAMP_HZ_S = 24000.0
 STEPPER_PULSES_PER_ROD_DEG = 8.8889  # 1.8 deg motor, 1/16, direct drive
 STEPPER_ANGLE_LIMIT_DEG = 16.0
 STEPPER_DIRECTION_INVERT = True
 STEPPER_VISION_TIMEOUT_MS = 150
-STEPPER_WATCHDOG_TIMER_ID = -1  # software timer; media pipeline owns hard timers
 STEPPER_ZERO_TOUCH_RECT = (210, 398, 380, 58)
 STEPPER_ZERO_TOUCH_EVENT = TOUCH_RELEASE_EVENT
 
@@ -211,6 +210,12 @@ ENCODER_PWM_DUTY_MIN = 0.25
 ENCODER_PWM_DUTY_MAX = 0.75
 ENCODER_PWM_INVERT = False
 ENCODER_PWM_SAMPLE_COUNT = 8
+ENCODER_STALL_TIMEOUT_MS = 80
+ENCODER_PWM_MISMATCH_DEG = 2.0
+CASCADE_TIMER_ID = -1
+CASCADE_PERIOD_MS = 5
+CASCADE_MIN_RATE_HZ = 80.0
+CASCADE_RATE_WINDOW_MS = 200
 ENCODER_CALIBRATION_VERSION = 1
 ENCODER_CALIBRATION_PATH = "/sdcard/ms42cg_encoder_calibration.json"
 ENCODER_CALIBRATION_TEMP_PATH = "/sdcard/ms42cg_encoder_calibration.tmp"
@@ -389,31 +394,70 @@ def restore_encoder_from_absolute(encoder, calibration, encoder_snapshot):
     return True
 
 
-def compute_angle_pid(target_angle_deg, actual_angle_deg, velocity_deg_s,
-                      dt_s, state):
-    error = float(target_angle_deg) - float(actual_angle_deg)
-    if abs(error) <= INNER_ANGLE_DEADBAND_DEG:
-        return {"enabled": False, "frequency_hz": 0.0, "direction": 0,
-                "integral_hz": 0.0, "target_angle_deg": float(target_angle_deg),
-                "actual_angle_deg": float(actual_angle_deg),
-                "actual_velocity_deg_s": float(velocity_deg_s),
-                "angle_error_deg": error, "fault": "angle_deadband"}
-    integral = float(state.get("integral_hz", 0.0)) + error * max(0.0, min(0.1, dt_s)) * INNER_KI_HZ_PER_DEG_S
-    raw = INNER_KP_HZ_PER_DEG * error + integral - INNER_KD_HZ_PER_DEG_S * float(velocity_deg_s)
-    raw = max(-STEPPER_MAX_FREQUENCY_HZ, min(STEPPER_MAX_FREQUENCY_HZ, raw))
-    previous = float(state.get("frequency_hz", 0.0))
-    direction = 1 if raw > 0 else -1
-    if previous and direction != int(state.get("direction", direction)):
-        frequency = max(0.0, previous - STEPPER_FREQUENCY_RAMP_HZ_S * max(0.0, min(0.1, dt_s)))
-        direction = int(state.get("direction", direction))
+def compute_angle_pid(
+        target_angle_deg, actual_angle_deg, actual_velocity_deg_s,
+        dt_s, state, kp_hz_per_deg, ki_hz_per_deg_s,
+        kd_hz_per_deg_s, max_frequency_hz, ramp_hz_s,
+        angle_limit_deg):
+    """Compute signed real-angle control using MS42CG feedback."""
+    dt_s = max(0.0, min(float(dt_s), 0.1))
+    target_angle_deg = max(
+        -angle_limit_deg, min(angle_limit_deg, float(target_angle_deg)))
+    actual_angle_deg = float(actual_angle_deg)
+    angle_error = target_angle_deg - actual_angle_deg
+    previous_frequency = max(float(state.get("frequency_hz", 0.0)), 0.0)
+    previous_direction = int(state.get("direction", 0))
+    integral_hz = float(state.get("integral_hz", 0.0))
+    result = {
+        "enabled": False, "frequency_hz": 0.0, "direction": 0,
+        "integral_hz": integral_hz,
+        "target_angle_deg": target_angle_deg,
+        "actual_angle_deg": actual_angle_deg,
+        "actual_velocity_deg_s": float(actual_velocity_deg_s),
+        "angle_error_deg": angle_error, "fault": "none",
+    }
+    outward_at_limit = (
+        (actual_angle_deg >= angle_limit_deg and angle_error >= 0.0) or
+        (actual_angle_deg <= -angle_limit_deg and angle_error <= 0.0))
+    if outward_at_limit:
+        result["fault"] = "angle_limit"
+        return result
+    if abs(angle_error) <= 360.0 / 4096.0:
+        result["fault"] = "angle_deadband"
+        return result
+    candidate_integral = integral_hz + ki_hz_per_deg_s * angle_error * dt_s
+    raw_frequency = (
+        kp_hz_per_deg * angle_error + candidate_integral -
+        kd_hz_per_deg_s * float(actual_velocity_deg_s))
+    if abs(raw_frequency) > max_frequency_hz:
+        raw_frequency = max(
+            -max_frequency_hz, min(max_frequency_hz, raw_frequency))
     else:
-        frequency = min(abs(raw), previous + STEPPER_FREQUENCY_RAMP_HZ_S * max(0.0, min(0.1, dt_s)))
-    return {"enabled": frequency > 0.0, "frequency_hz": frequency,
-            "direction": direction, "integral_hz": integral,
-            "target_angle_deg": float(target_angle_deg),
-            "actual_angle_deg": float(actual_angle_deg),
-            "actual_velocity_deg_s": float(velocity_deg_s),
-            "angle_error_deg": error, "fault": "none"}
+        integral_hz = candidate_integral
+        result["integral_hz"] = integral_hz
+    desired_direction = 1 if raw_frequency > 0.0 else -1
+    desired_frequency = abs(raw_frequency)
+    max_delta = max(0.0, float(ramp_hz_s) * dt_s)
+    if (previous_frequency > 0.0 and previous_direction != 0 and
+            previous_direction != desired_direction):
+        next_frequency = max(0.0, previous_frequency - max_delta)
+        result["fault"] = "reversing"
+        if next_frequency <= 0.0:
+            return result
+        result.update({"enabled": True, "frequency_hz": next_frequency,
+                       "direction": previous_direction})
+        return result
+    if desired_frequency >= previous_frequency:
+        next_frequency = min(desired_frequency,
+                             previous_frequency + max_delta)
+    else:
+        next_frequency = max(desired_frequency,
+                             previous_frequency - max_delta)
+    if next_frequency <= 0.0:
+        return result
+    result.update({"enabled": True, "frequency_hz": next_frequency,
+                   "direction": desired_direction})
+    return result
 
 
 class MS42CGEncoder:
@@ -587,6 +631,153 @@ class MS42CGEncoder:
             self.abz_released = True
         self.stop_pwm_capture()
 
+
+class RodCascadeController:
+    """200 Hz real-angle controller and consolidated safety watchdog."""
+
+    def __init__(self, encoder, stepper, ticks_ms_fn=None,
+                 ticks_us_fn=None, ticks_diff_fn=None, timer_factory=None,
+                 armed=True, startup_fault="ENC ZERO REQUIRED"):
+        self.encoder = encoder
+        self.stepper = stepper
+        self.ticks_ms = ticks_ms_fn if ticks_ms_fn is not None else time.ticks_ms
+        self.ticks_us = ticks_us_fn if ticks_us_fn is not None else time.ticks_us
+        self.ticks_diff = (ticks_diff_fn if ticks_diff_fn is not None
+                           else time.ticks_diff)
+        self.target_angle_deg = 0.0
+        self.visual_timestamp_ms = 0
+        self.visual_valid = False
+        self.absolute_zero_count = None
+        self.armed = bool(armed)
+        self.startup_fault = startup_fault
+        self.pid_state = {
+            "integral_hz": 0.0, "frequency_hz": 0.0,
+            "direction": 0, "last_update_ms": 0, "fault": "none",
+        }
+        self.last_tick_ms = self.ticks_ms()
+        self.rate_window_ms = self.last_tick_ms
+        self.rate_ticks = 0
+        self.control_rate_hz = 0.0
+        self.last_invalid_transitions = 0
+        self.last_snapshot = {"angle_deg": 0.0, "velocity_deg_s": 0.0}
+        self.fault = "none"
+        factory = timer_factory if timer_factory is not None else Timer
+        self.timer = factory(CASCADE_TIMER_ID)
+        self.timer.init(mode=Timer.PERIODIC, period=CASCADE_PERIOD_MS,
+                        callback=self.tick)
+
+    def set_visual_target(self, angle_deg, timestamp_ms, valid):
+        self.target_angle_deg = max(
+            -STEPPER_ANGLE_LIMIT_DEG,
+            min(STEPPER_ANGLE_LIMIT_DEG, float(angle_deg)))
+        self.visual_timestamp_ms = int(timestamp_ms)
+        self.visual_valid = bool(valid)
+
+    def arm(self, absolute_zero_count):
+        self.absolute_zero_count = int(absolute_zero_count)
+        self.armed = True
+        self.startup_fault = "none"
+        self.pid_state["integral_hz"] = 0.0
+        self.pid_state["frequency_hz"] = 0.0
+        self.pid_state["direction"] = 0
+
+    def disarm(self, fault="ENC ZERO REQUIRED"):
+        self.armed = False
+        self.startup_fault = fault
+        self._stop_fault(fault, disable=True)
+
+    def _stop_fault(self, fault, disable):
+        self.fault = fault
+        self.pid_state["fault"] = fault
+        self.pid_state["frequency_hz"] = 0.0
+        self.pid_state["direction"] = 0
+        self.stepper.stop(disable=disable)
+
+    def tick(self, timer):
+        now_ms = self.ticks_ms()
+        now_us = self.ticks_us()
+        snapshot = self.encoder.snapshot(now_us)
+        self.last_snapshot = snapshot
+        dt_ms = self.ticks_diff(now_ms, self.last_tick_ms)
+        dt_s = max(0.001, min(max(dt_ms, 0) / 1000.0, 0.1))
+        self.last_tick_ms = now_ms
+        self.rate_ticks += 1
+        rate_elapsed = self.ticks_diff(now_ms, self.rate_window_ms)
+        if rate_elapsed >= CASCADE_RATE_WINDOW_MS:
+            self.control_rate_hz = self.rate_ticks * 1000.0 / rate_elapsed
+            self.rate_ticks = 0
+            self.rate_window_ms = now_ms
+        if not self.armed:
+            self._stop_fault(self.startup_fault, disable=True)
+            return
+        visual_age = self.ticks_diff(now_ms, self.visual_timestamp_ms)
+        if (not self.visual_valid or visual_age < 0 or
+                visual_age > STEPPER_VISION_TIMEOUT_MS):
+            self._stop_fault("VISION TIMEOUT", disable=False)
+            return
+        if (self.control_rate_hz > 0.0 and
+                self.control_rate_hz < CASCADE_MIN_RATE_HZ):
+            self._stop_fault("CTRL SLOW", disable=True)
+            return
+        invalid_transitions = snapshot["invalid_transitions"]
+        if invalid_transitions > self.last_invalid_transitions:
+            self.last_invalid_transitions = invalid_transitions
+            self._stop_fault("AB INVALID", disable=True)
+            return
+        self.last_invalid_transitions = invalid_transitions
+        actual_angle = float(snapshot["angle_deg"])
+        angle_error = self.target_angle_deg - actual_angle
+        last_edge_us = snapshot["last_edge_us"]
+        edge_age_us = (self.ticks_diff(now_us, last_edge_us)
+                       if last_edge_us else 0)
+        if (abs(angle_error) > (360.0 / ENCODER_COUNTS_PER_REV) and
+                last_edge_us and
+                edge_age_us > ENCODER_STALL_TIMEOUT_MS * 1000):
+            self._stop_fault("ENCODER STALL", disable=True)
+            return
+        if (snapshot["pwm_valid"] and
+                snapshot["absolute_count"] is not None and
+                self.absolute_zero_count is not None):
+            half_revolution = ENCODER_COUNTS_PER_REV // 2
+            absolute_delta = (
+                (int(snapshot["absolute_count"]) -
+                 int(self.absolute_zero_count) + half_revolution) %
+                ENCODER_COUNTS_PER_REV) - half_revolution
+            absolute_angle = encoder_count_to_angle(
+                absolute_delta, ENCODER_COUNTS_PER_REV)
+            if abs(absolute_angle - actual_angle) > ENCODER_PWM_MISMATCH_DEG:
+                self._stop_fault("ENC MISMATCH", disable=True)
+                return
+        command = compute_angle_pid(
+            self.target_angle_deg, actual_angle,
+            snapshot["velocity_deg_s"], dt_s, self.pid_state,
+            INNER_KP_HZ_PER_DEG, INNER_KI_HZ_PER_DEG_S,
+            INNER_KD_HZ_PER_DEG_S, STEPPER_MAX_FREQUENCY_HZ,
+            STEPPER_FREQUENCY_RAMP_HZ_S, STEPPER_ANGLE_LIMIT_DEG)
+        self.pid_state = command
+        self.fault = command["fault"]
+        self.stepper.apply(command)
+
+    def status(self, now_ms=None):
+        return {
+            "zeroed": self.armed,
+            "enabled": self.pid_state.get("frequency_hz", 0.0) > 0.0,
+            "fault": self.fault,
+            "target_angle_deg": self.target_angle_deg,
+            "actual_angle_deg": self.last_snapshot.get("angle_deg", 0.0),
+            "actual_velocity_deg_s": self.last_snapshot.get(
+                "velocity_deg_s", 0.0),
+            "frequency_hz": self.pid_state.get("frequency_hz", 0.0),
+            "direction": self.pid_state.get("direction", 0),
+            "angle_error_deg": self.pid_state.get("angle_error_deg", 0.0),
+            "control_rate_hz": self.control_rate_hz,
+            "encoder_state": "OK" if self.armed else self.startup_fault,
+        }
+
+    def deinit(self):
+        self.timer.deinit()
+        self.stepper.stop(disable=True)
+
 def estimate_velocity(samples, ticks_diff_fn=None):
     if len(samples) < 2:
         return 0.0, 0.0
@@ -662,123 +853,6 @@ def compute_outer_balance_target(error_cm, velocity_cm_s,
     return max(-float(angle_limit_deg), min(float(angle_limit_deg), target))
 
 
-def apply_stepper_direction(direction, invert):
-    direction = 1 if float(direction) >= 0 else -1
-    return -direction if invert else direction
-
-
-def new_stepper_control_state(now_ms=0):
-    return {
-        "zeroed": False,
-        "frequency_hz": 0.0,
-        "direction": 0,
-        "motion_sign": 0,
-        "estimated_angle_deg": 0.0,
-        "target_angle_deg": 0.0,
-        "last_update_ms": now_ms,
-        "fault": "not_zeroed",
-    }
-
-
-def compute_stepper_command(
-        error_cm, velocity_cm_s, measurement_valid, zeroed,
-        now_ms, state, kp_angle_deg_per_cm, kd_angle_deg_per_cm_s,
-        edge_boost_deg_per_cm2,
-        angle_track_hz_per_deg, angle_tolerance_deg, deadband_cm,
-        min_frequency_hz, max_frequency_hz,
-        frequency_ramp_hz_s, pulses_per_degree, angle_limit_deg,
-        max_motion_ms,
-        direction_invert=False, ticks_diff_fn=None):
-    """Return the next safe D36A command without touching hardware."""
-    if ticks_diff_fn is None:
-        elapsed_ms = time.ticks_diff(now_ms, state["last_update_ms"])
-    else:
-        elapsed_ms = ticks_diff_fn(now_ms, state["last_update_ms"])
-    elapsed_s = min(max(elapsed_ms, 0), max_motion_ms) / 1000.0
-
-    previous_frequency = max(float(state.get("frequency_hz", 0.0)), 0.0)
-    previous_sign = state.get("motion_sign", state.get("direction", 0))
-    estimated_angle = float(state.get("estimated_angle_deg", 0.0))
-    if pulses_per_degree > 0.0:
-        estimated_angle += (
-            previous_sign * previous_frequency * elapsed_s /
-            pulses_per_degree)
-    estimated_angle = max(
-        -angle_limit_deg, min(angle_limit_deg, estimated_angle))
-
-    result = {
-        "zeroed": bool(zeroed),
-        "enabled": False,
-        "frequency_hz": 0.0,
-        "direction": 0,
-        "motion_sign": 0,
-        "estimated_angle_deg": estimated_angle,
-        "target_angle_deg": float(state.get("target_angle_deg", 0.0)),
-        "last_update_ms": now_ms,
-        "fault": "none",
-    }
-    if not zeroed:
-        result["fault"] = "not_zeroed"
-        return result
-    if not measurement_valid:
-        # Stop STEP pulses but keep EN active so the rod holds its last angle
-        # while an edge-positioned ball is temporarily outside vision.
-        result["fault"] = "vision_hold"
-        return result
-
-    if abs(error_cm) <= deadband_cm:
-        target_angle = 0.0
-    else:
-        target_angle = (
-            kp_angle_deg_per_cm * error_cm +
-            edge_boost_deg_per_cm2 * error_cm * abs(error_cm) -
-            kd_angle_deg_per_cm_s * velocity_cm_s)
-    target_angle = max(
-        -angle_limit_deg, min(angle_limit_deg, target_angle))
-    result["target_angle_deg"] = target_angle
-    angle_error = target_angle - estimated_angle
-    if abs(angle_error) <= angle_tolerance_deg:
-        result["fault"] = "angle_deadband"
-        return result
-
-    logical_direction = 1 if angle_error > 0.0 else -1
-    if ((estimated_angle >= angle_limit_deg and logical_direction > 0) or
-            (estimated_angle <= -angle_limit_deg and logical_direction < 0)):
-        result["fault"] = "angle_limit"
-        return result
-
-    target_frequency = max(
-        min(abs(angle_error) * angle_track_hz_per_deg,
-            max_frequency_hz),
-        min_frequency_hz)
-    max_delta = frequency_ramp_hz_s * elapsed_s
-    if previous_sign != 0 and previous_sign != logical_direction:
-        next_frequency = max(0.0, previous_frequency - max_delta)
-        if next_frequency > 0.0:
-            logical_direction = previous_sign
-            result["fault"] = "reversing"
-        else:
-            result["fault"] = "reversing"
-            return result
-    elif target_frequency >= previous_frequency:
-        next_frequency = min(
-            target_frequency, previous_frequency + max_delta)
-        if previous_frequency <= 0.0 and next_frequency > 0.0:
-            next_frequency = max(next_frequency, min_frequency_hz)
-    else:
-        next_frequency = max(
-            target_frequency, previous_frequency - max_delta)
-    physical_direction = (-logical_direction if direction_invert
-                          else logical_direction)
-    result.update({
-        "enabled": next_frequency > 0.0,
-        "frequency_hz": next_frequency,
-        "direction": physical_direction,
-        "motion_sign": logical_direction,
-    })
-    return result
-
-
 class D36AStepper:
     """Hardware-only D36A adapter; control decisions stay in pure code."""
 
@@ -798,12 +872,6 @@ class D36AStepper:
         self.running = False
         self.last_frequency_hz = 0
         self.last_direction = 0
-        self.watchdog = Timer(STEPPER_WATCHDOG_TIMER_ID)
-        self.watchdog_armed = False
-
-    def _watchdog_expired(self, timer):
-        self.watchdog_armed = False
-        self.stop(disable=True, cancel_watchdog=False)
 
     def apply(self, command):
         if not command.get("enabled", False):
@@ -814,7 +882,9 @@ class D36AStepper:
         frequency_hz = max(
             int(round(command["frequency_hz"])),
             int(STEPPER_MIN_FREQUENCY_HZ))
-        direction = 1 if command["direction"] > 0 else -1
+        logical_direction = 1 if command["direction"] > 0 else -1
+        direction = (-logical_direction if STEPPER_DIRECTION_INVERT
+                     else logical_direction)
         if self.running and direction != self.last_direction:
             self.pwm.duty(0)
             self.running = False
@@ -829,25 +899,8 @@ class D36AStepper:
         if not self.running:
             self.pwm.duty(50)
             self.running = True
-        try:
-            self.watchdog.init(
-                mode=Timer.ONE_SHOT, period=STEPPER_VISION_TIMEOUT_MS,
-                callback=self._watchdog_expired)
-            self.watchdog_armed = True
-        except Exception:
-            self.watchdog_armed = False
-            self.stop(disable=True, cancel_watchdog=False)
-            raise
 
     def stop(self, disable=True, cancel_watchdog=True):
-        if cancel_watchdog and self.watchdog_armed:
-            try:
-                self.watchdog.deinit()
-            finally:
-                # CanMV Timer objects cannot be initialized again after
-                # deinit(); create a fresh software timer for the next move.
-                self.watchdog = Timer(STEPPER_WATCHDOG_TIMER_ID)
-                self.watchdog_armed = False
         try:
             if self.running:
                 self.pwm.duty(0)
@@ -1988,13 +2041,17 @@ def format_deviation_msg(dx, dy, valid):
 
 
 def format_stepper_msg(command):
-    return "M:{},R:{},F:{:04d},D:{:+d},A:{:+.2f},T:{:+.2f},E:{}\n".format(
+    return ("M:{},R:{},F:{:04d},D:{:+d},A:{:+.2f},T:{:+.2f},"
+            "V:{:+.1f},E:{:+.2f},H:{:.1f},S:{}\n").format(
         1 if command.get("zeroed", False) else 0,
         1 if command.get("enabled", False) else 0,
         int(round(command.get("frequency_hz", 0.0))),
         int(command.get("direction", 0)),
-        float(command.get("estimated_angle_deg", 0.0)),
+        float(command.get("actual_angle_deg", 0.0)),
         float(command.get("target_angle_deg", 0.0)),
+        float(command.get("actual_velocity_deg_s", 0.0)),
+        float(command.get("angle_error_deg", 0.0)),
+        float(command.get("control_rate_hz", 0.0)),
         command.get("fault", "unknown")).encode("utf-8")
 
 
@@ -2454,58 +2511,27 @@ def axis_measurement(current_control, cal_state, task_state=None,
     return measurement
 
 
-def update_stepper_control(measurement, stepper, stepper_state,
+def update_stepper_control(measurement, cascade_controller,
                            now_ms, control_timestamp_ms):
-    global encoder_runtime
-    if encoder_runtime is not None:
-        snapshot = encoder_runtime.snapshot()
-        if not stepper_state.get("zeroed", False):
-            stepper.stop(disable=False)
-            return dict(stepper_state, fault="encoder_zero_wait",
-                        actual_angle_deg=snapshot["angle_deg"],
-                        actual_velocity_deg_s=snapshot["velocity_deg_s"])
-        if not measurement.get("valid", False):
-            stepper.stop(disable=False)
-            return dict(stepper_state, fault="vision_hold",
-                        actual_angle_deg=snapshot["angle_deg"],
-                        actual_velocity_deg_s=snapshot["velocity_deg_s"])
+    age_ms = time.ticks_diff(now_ms, control_timestamp_ms)
+    vision_fresh = (
+        measurement.get("valid", False) and
+        age_ms >= 0 and age_ms <= STEPPER_VISION_TIMEOUT_MS)
+    if vision_fresh:
         target_angle = compute_outer_balance_target(
             measurement.get("error_cm", 0.0),
             measurement.get("velocity_cm_s", 0.0),
             OUTER_BALANCE_KP_DEG_PER_CM, OUTER_BALANCE_KD_DEG_PER_CM_S,
             OUTER_BALANCE_ANGLE_LIMIT_DEG)
-        pid = compute_angle_pid(
-            target_angle, snapshot["angle_deg"], snapshot["velocity_deg_s"],
-            0.005, stepper_state)
-        command = dict(pid)
-        command["direction"] = apply_stepper_direction(
-            pid.get("direction", 0), STEPPER_DIRECTION_INVERT)
-        stepper.apply(command)
-        pid["zeroed"] = stepper_state.get("zeroed", False)
-        return pid
-    age_ms = time.ticks_diff(now_ms, control_timestamp_ms)
-    vision_fresh = (
-        measurement.get("valid", False) and
-        age_ms >= 0 and age_ms <= STEPPER_VISION_TIMEOUT_MS)
-    command = compute_stepper_command(
-        measurement.get("error_cm", 0.0),
-        measurement.get("velocity_cm_s", 0.0),
-        vision_fresh, stepper_state.get("zeroed", False),
-        now_ms, stepper_state,
-        STEPPER_KP_ANGLE_DEG_PER_CM, STEPPER_KD_ANGLE_DEG_PER_CM_S,
-        STEPPER_EDGE_BOOST_DEG_PER_CM2,
-        STEPPER_ANGLE_TRACK_HZ_PER_DEG, STEPPER_ANGLE_TOLERANCE_DEG,
-        STEPPER_DEADBAND_CM, STEPPER_MIN_FREQUENCY_HZ,
-        STEPPER_MAX_FREQUENCY_HZ, STEPPER_FREQUENCY_RAMP_HZ_S,
-        STEPPER_PULSES_PER_ROD_DEG, STEPPER_ANGLE_LIMIT_DEG,
-        STEPPER_VISION_TIMEOUT_MS,
-        STEPPER_DIRECTION_INVERT, time.ticks_diff)
-    stepper.apply(command)
-    return command
+    else:
+        target_angle = 0.0
+    cascade_controller.set_visual_target(
+        target_angle, control_timestamp_ms, vision_fresh)
+    return cascade_controller.status(now_ms)
 
 
 def publish_control_outputs(osd_img, capture, color_four, uart_obj, cal_state,
-                            stepper, stepper_state):
+                            cascade_controller):
     global task3_state, balance_workflow_state, encoder_runtime
     render_osd = should_render_osd(
         frame_counter + 1, OSD_EVERY_N_FRAMES)
@@ -2520,7 +2546,7 @@ def publish_control_outputs(osd_img, capture, color_four, uart_obj, cal_state,
             measurement = dict(measurement)
             measurement["valid"] = False
     stepper_state = update_stepper_control(
-        measurement, stepper, stepper_state,
+        measurement, cascade_controller,
         time.ticks_ms(), control_state.get("timestamp_ms", 0))
     draw_osd(osd_img, capture, color_four, uart_obj,
              cal_state, measurement, stepper_state, render_osd)
@@ -2673,14 +2699,23 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
                 color=C_WHITE)
             osd_img.draw_string_advanced(
                 DISPLAY_WIDTH - 240, 140, 17,
-                "A:{:+.2f}/{:+.2f} {}".format(
-                    stepper_state.get("estimated_angle_deg", 0.0),
+                "A:{:+.2f} T:{:+.2f}".format(
+                    stepper_state.get("actual_angle_deg", 0.0),
                     stepper_state.get("target_angle_deg", 0.0),
-                    stepper_state.get("fault", "unknown")),
+                ),
                 color=C_GREEN_TEXT if stepper_state.get("enabled") else C_WHITE)
             osd_img.draw_string_advanced(
                 DISPLAY_WIDTH - 240, 164, 15,
-                "Hold 2s: new target", color=C_WHITE)
+                "V:{:+.1f} E:{:+.2f}".format(
+                    stepper_state.get("actual_velocity_deg_s", 0.0),
+                    stepper_state.get("angle_error_deg", 0.0)),
+                color=C_WHITE)
+            osd_img.draw_string_advanced(
+                DISPLAY_WIDTH - 240, 186, 14,
+                "ENC:{} {:3.0f}Hz".format(
+                    stepper_state.get("encoder_state", "UNKNOWN"),
+                    stepper_state.get("control_rate_hz", 0.0)),
+                color=C_GREEN_TEXT if stepper_state.get("zeroed") else C_RED)
 
         if mode == BALANCE_WAIT_LEVEL:
             zero_x, zero_y, zero_w, zero_h = BALANCE_LEVEL_RECT
@@ -2689,7 +2724,7 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
                 color=C_CYAN_TEXT, thickness=3)
             osd_img.draw_string_advanced(
                 zero_x + 42, zero_y + 17, 20,
-                "LEVEL CONFIRM",
+                "LEVEL ROD - TAP ZERO",
                 color=C_CYAN_TEXT)
         if mode == BALANCE_ACTIVE and not measurement["valid"]:
             osd_img.draw_string_advanced(
@@ -2733,6 +2768,8 @@ def detection():
     print("=== Ball Position (new model) ===")
     wlan = None
     stepper = None
+    encoder = None
+    cascade_controller = None
     encoder_runtime = None
     # The new workflow always uses the geometric midpoint as the target;
     # there is no third-task trajectory in this mode.
@@ -2811,10 +2848,14 @@ def detection():
             start_camera_with_blob_fallback(start_camera_pipeline))
         stepper = D36AStepper(fpioa)
         print("D36A ready: STEP=pin13 DIR=pin11 EN=pin12 (disabled)")
-        encoder_runtime = MS42CGEncoder(fpioa)
-        encoder_runtime.start()
+        encoder = MS42CGEncoder(fpioa)
+        encoder_runtime = encoder
+        encoder.start()
         print("MS42CG encoder ready: A=IO19 B=IO20 Z=IO32 PWM=IO33")
-        stepper_state = new_stepper_control_state(time.ticks_ms())
+        cascade_controller = RodCascadeController(
+            encoder, stepper, armed=False,
+            startup_fault="ENC ZERO REQUIRED")
+        stepper_state = cascade_controller.status(time.ticks_ms())
         if saved_rod_level is not None:
             print("Saved level exists; waiting for fresh LEVEL CONFIRM")
         tp = TOUCH(0)
@@ -2857,12 +2898,9 @@ def detection():
                         encoder_runtime, saved_encoder_calibration,
                         encoder_snapshot):
                     encoder_zero_restored = True
-                    stepper_state.update({
-                        "zeroed": True,
-                        "estimated_angle_deg": 0.0,
-                        "target_angle_deg": 0.0,
-                        "fault": "saved_encoder_zero",
-                    })
+                    cascade_controller.arm(
+                        saved_encoder_calibration["zero_abs_count"])
+                    stepper_state = cascade_controller.status(time.ticks_ms())
                     print("MS42CG PWM zero restored; waiting for centre")
             touch_poll_counter += 1
             if touch_poll_counter >= TOUCH_POLL_EVERY_N_FRAMES:
@@ -2900,17 +2938,14 @@ def detection():
                             encoder_runtime.set_zero_from_absolute(
                                 encoder_calibration["zero_abs_count"])
                             encoder_zero_restored = True
+                            cascade_controller.arm(
+                                encoder_calibration["zero_abs_count"])
                             print("MS42CG ABZ/PWM zero saved to SD")
                     else:
                         print("PWM angle not ready; zero is session-only",
                               "valid=", getattr(encoder_runtime, "pwm_valid", False),
                               "abs=", getattr(encoder_runtime, "absolute_count", None))
-                    stepper_state.update({
-                        "zeroed": True,
-                        "estimated_angle_deg": 0.0,
-                        "target_angle_deg": 0.0,
-                        "fault": "level_confirmed",
-                    })
+                    stepper_state = cascade_controller.status(time.ticks_ms())
                     save_rod_level_calibration(
                         ROD_LEVEL_CALIBRATION_PATH, 0.0)
                     print("Rail level confirmed; geometric centre control armed")
@@ -2975,7 +3010,7 @@ def detection():
                             # validation frames and is published only once.
                             stepper_state = publish_control_outputs(
                                 osd_img, None, color_four, uart, cal_state,
-                                stepper, stepper_state)
+                                cascade_controller)
                         continue
 
                     capture = None
@@ -3126,7 +3161,7 @@ def detection():
 
                         stepper_state = publish_control_outputs(
                             osd_img, capture, color_four, uart, cal_state,
-                            stepper, stepper_state)
+                            cascade_controller)
 
                     perf_frame_count += 1
                     if perf_frame_count >= PERF_EVERY_N_FRAMES:
@@ -3177,11 +3212,13 @@ def detection():
     finally:
         ai2d_output_tensor = None
         try:
+            if cascade_controller is not None:
+                cascade_controller.deinit()
+            if encoder is not None:
+                encoder.deinit()
+                encoder_runtime = None
             if stepper is not None:
                 stepper.deinit()
-            if encoder_runtime is not None:
-                encoder_runtime.deinit()
-                encoder_runtime = None
         finally:
             cleanup_runtime_resources(rtsp_server, sensor, tensor_holder)
     return 0
