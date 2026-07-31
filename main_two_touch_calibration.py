@@ -162,13 +162,10 @@ STEPPER_EN_IO = 6
 STEPPER_KP_ANGLE_DEG_PER_CM = 0.55
 STEPPER_KD_ANGLE_DEG_PER_CM_S = 0.12
 STEPPER_EDGE_BOOST_DEG_PER_CM2 = 0.07
-STEPPER_ANGLE_TRACK_HZ_PER_DEG = 1200.0
-STEPPER_ANGLE_TOLERANCE_DEG = 0.03
 STEPPER_DEADBAND_CM = 0.15
 STEPPER_MIN_FREQUENCY_HZ = 220.0
 STEPPER_MAX_FREQUENCY_HZ = 800.0
 STEPPER_FREQUENCY_RAMP_HZ_S = 24000.0
-STEPPER_PULSES_PER_ROD_DEG = 8.8889  # 1.8 deg motor, 1/16, direct drive
 STEPPER_ANGLE_LIMIT_DEG = 16.0
 STEPPER_DIRECTION_INVERT = True
 STEPPER_VISION_TIMEOUT_MS = 150
@@ -317,19 +314,6 @@ def estimate_velocity(samples, ticks_diff_fn=None):
     )
 
 
-def new_stepper_control_state(now_ms=0):
-    return {
-        "zeroed": False,
-        "frequency_hz": 0.0,
-        "direction": 0,
-        "motion_sign": 0,
-        "estimated_angle_deg": 0.0,
-        "target_angle_deg": 0.0,
-        "last_update_ms": now_ms,
-        "fault": "not_zeroed",
-    }
-
-
 def compute_angle_pid(
         target_angle_deg, actual_angle_deg, actual_velocity_deg_s,
         dt_s, state, kp_hz_per_deg, ki_hz_per_deg_s,
@@ -408,101 +392,6 @@ def compute_angle_pid(
         "enabled": True,
         "frequency_hz": next_frequency,
         "direction": desired_direction,
-    })
-    return result
-
-
-def compute_stepper_command(
-        error_cm, velocity_cm_s, measurement_valid, zeroed,
-        now_ms, state, kp_angle_deg_per_cm, kd_angle_deg_per_cm_s,
-        edge_boost_deg_per_cm2,
-        angle_track_hz_per_deg, angle_tolerance_deg, deadband_cm,
-        min_frequency_hz, max_frequency_hz,
-        frequency_ramp_hz_s, pulses_per_degree, angle_limit_deg,
-        max_motion_ms,
-        direction_invert=False, ticks_diff_fn=None):
-    """Return the next safe D36A command without touching hardware."""
-    if ticks_diff_fn is None:
-        elapsed_ms = time.ticks_diff(now_ms, state["last_update_ms"])
-    else:
-        elapsed_ms = ticks_diff_fn(now_ms, state["last_update_ms"])
-    elapsed_s = min(max(elapsed_ms, 0), max_motion_ms) / 1000.0
-
-    previous_frequency = max(float(state.get("frequency_hz", 0.0)), 0.0)
-    previous_sign = state.get("motion_sign", state.get("direction", 0))
-    estimated_angle = float(state.get("actual_angle_deg", 0.0))
-    estimated_angle = max(
-        -angle_limit_deg, min(angle_limit_deg, estimated_angle))
-
-    result = {
-        "zeroed": bool(zeroed),
-        "enabled": False,
-        "frequency_hz": 0.0,
-        "direction": 0,
-        "motion_sign": 0,
-        "estimated_angle_deg": estimated_angle,
-        "target_angle_deg": float(state.get("target_angle_deg", 0.0)),
-        "last_update_ms": now_ms,
-        "fault": "none",
-    }
-    if not zeroed:
-        result["fault"] = "not_zeroed"
-        return result
-    if not measurement_valid:
-        # Stop STEP pulses but keep EN active so the rod holds its last angle
-        # while an edge-positioned ball is temporarily outside vision.
-        result["fault"] = "vision_hold"
-        return result
-
-    if abs(error_cm) <= deadband_cm:
-        target_angle = 0.0
-    else:
-        target_angle = (
-            kp_angle_deg_per_cm * error_cm +
-            edge_boost_deg_per_cm2 * error_cm * abs(error_cm) -
-            kd_angle_deg_per_cm_s * velocity_cm_s)
-    target_angle = max(
-        -angle_limit_deg, min(angle_limit_deg, target_angle))
-    result["target_angle_deg"] = target_angle
-    angle_error = target_angle - estimated_angle
-    if abs(angle_error) <= angle_tolerance_deg:
-        result["fault"] = "angle_deadband"
-        return result
-
-    logical_direction = 1 if angle_error > 0.0 else -1
-    if ((estimated_angle >= angle_limit_deg and logical_direction > 0) or
-            (estimated_angle <= -angle_limit_deg and logical_direction < 0)):
-        result["fault"] = "angle_limit"
-        return result
-
-    target_frequency = max(
-        min(abs(angle_error) * angle_track_hz_per_deg,
-            max_frequency_hz),
-        min_frequency_hz)
-    max_delta = frequency_ramp_hz_s * elapsed_s
-    if previous_sign != 0 and previous_sign != logical_direction:
-        next_frequency = max(0.0, previous_frequency - max_delta)
-        if next_frequency > 0.0:
-            logical_direction = previous_sign
-            result["fault"] = "reversing"
-        else:
-            result["fault"] = "reversing"
-            return result
-    elif target_frequency >= previous_frequency:
-        next_frequency = min(
-            target_frequency, previous_frequency + max_delta)
-        if previous_frequency <= 0.0 and next_frequency > 0.0:
-            next_frequency = max(next_frequency, min_frequency_hz)
-    else:
-        next_frequency = max(
-            target_frequency, previous_frequency - max_delta)
-    physical_direction = (-logical_direction if direction_invert
-                          else logical_direction)
-    result.update({
-        "enabled": next_frequency > 0.0,
-        "frequency_hz": next_frequency,
-        "direction": physical_direction,
-        "motion_sign": logical_direction,
     })
     return result
 
@@ -2267,11 +2156,9 @@ def handle_stepper_zero_touch(stepper_state, points, target_ready,
         "zeroed": True,
         "frequency_hz": 0.0,
         "direction": 0,
-        "motion_sign": 0,
-        "estimated_angle_deg": 0.0,
         "target_angle_deg": 0.0,
         "last_update_ms": now_ms,
-        "fault": "vision_invalid",
+        "fault": "ENC ZERO REQUIRED",
     })
     return next_state
 

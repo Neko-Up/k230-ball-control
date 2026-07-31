@@ -144,4 +144,3 @@ def test_axis_distance_is_drawn_before_zero_prompt_overlay():
     assert measurement_branch >= 0
     assert distance_label > measurement_branch
     assert zero_prompt > distance_label
-
