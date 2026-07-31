@@ -38,6 +38,8 @@ class FakePin:
     def irq(self, handler=None, trigger=None):
         if trigger is None:
             raise TypeError("'trigger' argument required")
+        if handler is None:
+            raise ValueError("invalid callback")
         self.callback = handler
         self.trigger = trigger
         return self
@@ -144,12 +146,19 @@ def test_snapshot_reports_angle_and_velocity_outside_irq_context():
     assert snapshot["last_edge_us"] == 0
 
 
-def test_deinit_disables_all_irq_callbacks():
-    encoder, _ = new_encoder()
+def test_deinit_leaves_registered_callbacks_dormant():
+    encoder, clock = new_encoder()
     encoder.start_abz()
     encoder.start_pwm_capture()
+    encoder.count = 10
     encoder.deinit()
-    assert encoder.a_pin.callback is None
-    assert encoder.b_pin.callback is None
-    assert encoder.z_pin.callback is None
-    assert encoder.pwm_pin.callback is None
+    assert callable(encoder.a_pin.callback)
+    assert callable(encoder.b_pin.callback)
+    assert callable(encoder.z_pin.callback)
+    assert callable(encoder.pwm_pin.callback)
+    set_ab(encoder, clock, 0, 1)
+    encoder.z_pin.edge(1)
+    encoder.pwm_pin.edge(1)
+    assert encoder.count == 10
+    assert encoder.z_seen is False
+    assert encoder.pwm_sample_index == 0

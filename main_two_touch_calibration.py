@@ -420,6 +420,7 @@ class MS42CGEncoder:
         self.absolute_zero_count = 0
         self.absolute_count = None
         self.pwm_valid = False
+        self.abz_active = False
         self.pwm_capture_active = False
         self.pwm_rise_us = 0
         self.pwm_period_us = 0
@@ -431,6 +432,7 @@ class MS42CGEncoder:
         self.velocity_deg_s = 0.0
 
     def start_abz(self):
+        self.abz_active = True
         self.previous_ab = ((int(self.a_pin.value()) << 1) |
                             int(self.b_pin.value()))
         self.a_pin.irq(handler=self._ab_edge, trigger=Pin.IRQ_BOTH)
@@ -438,6 +440,8 @@ class MS42CGEncoder:
         self.z_pin.irq(handler=self._z_edge, trigger=Pin.IRQ_BOTH)
 
     def _ab_edge(self, pin):
+        if not self.abz_active:
+            return
         now_us = self.ticks_us()
         current_ab = ((int(self.a_pin.value()) << 1) |
                       int(self.b_pin.value()))
@@ -450,6 +454,8 @@ class MS42CGEncoder:
         self.last_edge_us = now_us
 
     def _z_edge(self, pin):
+        if not self.abz_active:
+            return
         if self.z_pin.value():
             self.z_seen = True
             self.z_index_count = self.count
@@ -491,7 +497,6 @@ class MS42CGEncoder:
 
     def stop_pwm_capture(self):
         self.pwm_capture_active = False
-        self.pwm_pin.irq(handler=None, trigger=Pin.IRQ_BOTH)
 
     def set_zero_from_absolute(self, count):
         self.absolute_zero_count = int(count) % ENCODER_COUNTS_PER_REV
@@ -532,9 +537,7 @@ class MS42CGEncoder:
         }
 
     def deinit(self):
-        self.a_pin.irq(handler=None, trigger=Pin.IRQ_BOTH)
-        self.b_pin.irq(handler=None, trigger=Pin.IRQ_BOTH)
-        self.z_pin.irq(handler=None, trigger=Pin.IRQ_BOTH)
+        self.abz_active = False
         self.stop_pwm_capture()
 
 
