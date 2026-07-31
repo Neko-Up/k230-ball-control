@@ -269,63 +269,124 @@ def quadrature_delta(previous_state, current_state):
     return table[((int(previous_state) & 3) << 2) | (int(current_state) & 3)]
 
 
-def encoder_count_to_angle(delta):
-    return float(delta) * 360.0 / ENCODER_COUNTS_PER_REV
+def wrapped_encoder_delta(current, zero, counts_per_rev):
+    """Return the shortest signed circular distance from zero to current."""
+    counts_per_rev = int(counts_per_rev)
+    if counts_per_rev <= 0:
+        return 0
+    half_revolution = counts_per_rev // 2
+    return ((int(current) - int(zero) + half_revolution) %
+            counts_per_rev) - half_revolution
 
 
-def pwm_duty_to_count(high_us, period_us):
-    if period_us <= 0:
+def encoder_count_to_angle(delta, counts_per_rev):
+    counts_per_rev = int(counts_per_rev)
+    if counts_per_rev <= 0:
+        return 0.0
+    return float(delta) * 360.0 / counts_per_rev
+
+
+def pwm_duty_to_count(high_us, period_us, counts_per_rev,
+                      duty_min, duty_max, invert):
+    if period_us <= 0 or counts_per_rev <= 0 or duty_max <= duty_min:
         return None
     duty = float(high_us) / float(period_us)
-    if duty < ENCODER_PWM_DUTY_MIN or duty > ENCODER_PWM_DUTY_MAX:
+    if duty < duty_min or duty > duty_max:
         return None
-    normalized = ((duty - ENCODER_PWM_DUTY_MIN) /
-                  (ENCODER_PWM_DUTY_MAX - ENCODER_PWM_DUTY_MIN))
-    if ENCODER_PWM_INVERT:
+    normalized = (duty - duty_min) / (duty_max - duty_min)
+    if invert:
         normalized = 1.0 - normalized
-    return max(0, min(ENCODER_COUNTS_PER_REV - 1,
-                      int(round(normalized * ENCODER_COUNTS_PER_REV))))
+    count = int(round(normalized * counts_per_rev))
+    return max(0, min(int(counts_per_rev) - 1, count))
 
 
 def validate_encoder_calibration(data):
+    """Accept only a complete MS42CG absolute-zero calibration record."""
     if not isinstance(data, dict):
         return None
-    zero = data.get("zero_abs_count")
-    if (data.get("version") != ENCODER_CALIBRATION_VERSION or
-            type(zero) is not int or not 0 <= zero < ENCODER_COUNTS_PER_REV):
+    if (data.get("version") != 1 or
+            data.get("encoder_model") != "MS42CG" or
+            data.get("counts_per_rev") != 4096 or
+            type(data.get("zero_abs_count")) is not int or
+            not 0 <= data["zero_abs_count"] < 4096 or
+            type(data.get("pwm_invert")) is not bool):
         return None
-    return {"version": ENCODER_CALIBRATION_VERSION,
-            "zero_abs_count": zero}
+    z_index_count = data.get("z_index_count")
+    if (z_index_count is not None and
+            (type(z_index_count) is not int or
+             not 0 <= z_index_count < 4096)):
+        return None
+    return dict(data)
 
 
 def load_encoder_calibration(path=ENCODER_CALIBRATION_PATH,
-                             open_fn=open, json_module=ujson):
+                             open_fn=open, json_module=None):
+    if json_module is None:
+        json_module = ujson
     try:
         with open_fn(path, "r") as file_obj:
-            return validate_encoder_calibration(json_module.load(file_obj))
+            data = json_module.load(file_obj)
+        return validate_encoder_calibration(data)
     except (OSError, ValueError, TypeError):
         return None
 
 
-def save_encoder_calibration(zero_abs_count,
-                             path=ENCODER_CALIBRATION_PATH,
-                             temp_path=ENCODER_CALIBRATION_TEMP_PATH,
-                             open_fn=open, json_module=ujson,
-                             os_module=uos):
-    if type(zero_abs_count) is not int or not 0 <= zero_abs_count < ENCODER_COUNTS_PER_REV:
+def save_encoder_calibration(path, calibration, open_fn=open,
+                             rename_fn=None, json_module=None):
+    """Complete a temporary JSON write before replacing calibration."""
+    validated = validate_encoder_calibration(calibration)
+    if validated is None:
         return False
+    if json_module is None:
+        json_module = ujson
+    if rename_fn is None:
+        rename_fn = uos.rename
+    temp_path = path + ".tmp"
     try:
         with open_fn(temp_path, "w") as file_obj:
-            json_module.dump({"version": ENCODER_CALIBRATION_VERSION,
-                              "zero_abs_count": zero_abs_count}, file_obj)
-        try:
-            os_module.remove(path)
-        except OSError:
-            pass
-        os_module.rename(temp_path, path)
+            json_module.dump(validated, file_obj)
+        rename_fn(temp_path, path)
         return True
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as error:
+        print("Encoder calibration save failed:", error)
         return False
+
+
+def calibrate_encoder_zero(encoder_snapshot, z_index_count=None):
+    if (not encoder_snapshot.get("pwm_valid", False) or
+            encoder_snapshot.get("absolute_count") is None):
+        return None
+    absolute_count = encoder_snapshot["absolute_count"]
+    if (type(absolute_count) is not int or
+            not 0 <= absolute_count < ENCODER_COUNTS_PER_REV):
+        return None
+    calibration = {
+        "version": 1,
+        "encoder_model": "MS42CG",
+        "counts_per_rev": ENCODER_COUNTS_PER_REV,
+        "zero_abs_count": absolute_count,
+        "pwm_invert": bool(ENCODER_PWM_INVERT),
+    }
+    if z_index_count is not None:
+        calibration["z_index_count"] = int(z_index_count)
+    return validate_encoder_calibration(calibration)
+
+
+def restore_encoder_from_absolute(encoder, calibration, encoder_snapshot):
+    calibration = validate_encoder_calibration(calibration)
+    if (calibration is None or
+            not encoder_snapshot.get("pwm_valid", False) or
+            encoder_snapshot.get("absolute_count") is None):
+        return False
+    absolute_count = int(encoder_snapshot["absolute_count"])
+    zero_count = calibration["zero_abs_count"]
+    relative_count = wrapped_encoder_delta(
+        absolute_count, zero_count, ENCODER_COUNTS_PER_REV)
+    encoder.absolute_count = absolute_count
+    encoder.absolute_zero_count = zero_count
+    encoder.count = relative_count
+    encoder.snapshot_count = relative_count
+    return True
 
 
 def compute_angle_pid(target_angle_deg, actual_angle_deg, velocity_deg_s,
@@ -356,7 +417,9 @@ def compute_angle_pid(target_angle_deg, actual_angle_deg, velocity_deg_s,
 
 
 class MS42CGEncoder:
-    def __init__(self, fpioa):
+    """Low-allocation ABZ/PWM capture adapter for the MS42CG encoder."""
+
+    def __init__(self, fpioa, ticks_us_fn=None, ticks_diff_fn=None):
         fpioa.set_function(ENCODER_A_IO, fpioa.GPIO19, ie=1, oe=0)
         fpioa.set_function(ENCODER_B_IO, fpioa.GPIO20, ie=1, oe=0)
         fpioa.set_function(ENCODER_Z_IO, fpioa.GPIO32, ie=1, oe=0)
@@ -365,109 +428,164 @@ class MS42CGEncoder:
         self.b_pin = Pin(ENCODER_B_IO, Pin.IN, pull=Pin.PULL_NONE)
         self.z_pin = Pin(ENCODER_Z_IO, Pin.IN, pull=Pin.PULL_NONE)
         self.pwm_pin = Pin(ENCODER_PWM_IO, Pin.IN, pull=Pin.PULL_NONE)
+        self.ticks_us = ticks_us_fn if ticks_us_fn is not None else time.ticks_us
+        self.ticks_diff = (ticks_diff_fn if ticks_diff_fn is not None
+                           else time.ticks_diff)
         self.count = 0
         self.previous_ab = 0
         self.invalid_transitions = 0
         self.last_edge_us = 0
+        self.z_seen = False
+        self.z_index_count = None
+        self.absolute_zero_count = 0
+        self.absolute_count = None
+        self.pwm_valid = False
+        self.abz_active = False
+        self.abz_released = False
+        self.pwm_capture_active = False
+        self.pwm_pin_released = False
+        self.pwm_rise_us = 0
+        self.pwm_period_us = 0
+        self.pwm_sample_index = 0
+        self.pwm_high_samples = [0] * ENCODER_PWM_SAMPLE_COUNT
+        self.pwm_period_samples = [0] * ENCODER_PWM_SAMPLE_COUNT
         self.snapshot_count = 0
         self.snapshot_us = 0
         self.velocity_deg_s = 0.0
-        self.z_index_count = None
-        self.absolute_count = None
-        self.pwm_valid = False
-        self.pwm_active = False
-        self.pwm_rise_us = 0
-        self.pwm_period_us = 0
-        self.pwm_high_samples = []
-        self.pwm_period_samples = []
-        self.absolute_zero_count = None
 
     def start(self):
-        self.previous_ab = (int(self.a_pin.value()) << 1) | int(self.b_pin.value())
+        self.start_abz()
+        self.start_pwm_capture()
+
+    def start_abz(self):
+        self.abz_active = True
+        self.previous_ab = ((int(self.a_pin.value()) << 1) |
+                            int(self.b_pin.value()))
         self.a_pin.irq(handler=self._ab_edge, trigger=Pin.IRQ_BOTH)
         self.b_pin.irq(handler=self._ab_edge, trigger=Pin.IRQ_BOTH)
         self.z_pin.irq(handler=self._z_edge, trigger=Pin.IRQ_BOTH)
-        self.pwm_active = True
-        self.pwm_pin.irq(handler=self._pwm_edge, trigger=Pin.IRQ_BOTH)
 
     def _ab_edge(self, pin):
-        current = (int(self.a_pin.value()) << 1) | int(self.b_pin.value())
+        if not self.abz_active:
+            return
+        now_us = self.ticks_us()
+        current = ((int(self.a_pin.value()) << 1) |
+                   int(self.b_pin.value()))
         if (self.previous_ab ^ current) == 3:
             self.invalid_transitions += 1
         else:
             self.count += quadrature_delta(self.previous_ab, current)
         self.previous_ab = current
-        self.last_edge_us = time.ticks_us()
+        self.last_edge_us = now_us
 
     def _z_edge(self, pin):
+        if not self.abz_active:
+            return
         if self.z_pin.value():
+            self.z_seen = True
             self.z_index_count = self.count
 
+    def start_pwm_capture(self):
+        self.pwm_sample_index = 0
+        self.pwm_rise_us = 0
+        self.pwm_period_us = 0
+        self.pwm_valid = False
+        self.pwm_capture_active = True
+        self.pwm_pin.irq(handler=self._pwm_edge, trigger=Pin.IRQ_BOTH)
+
     def _pwm_edge(self, pin):
-        now = time.ticks_us()
+        if not self.pwm_capture_active:
+            return
+        now = self.ticks_us()
         if self.pwm_pin.value():
             if self.pwm_rise_us:
-                self.pwm_period_us = time.ticks_diff(now, self.pwm_rise_us)
+                self.pwm_period_us = self.ticks_diff(now, self.pwm_rise_us)
             self.pwm_rise_us = now
             return
         if not self.pwm_rise_us or self.pwm_period_us <= 0:
             return
-        high_us = time.ticks_diff(now, self.pwm_rise_us)
-        self.pwm_high_samples.append(high_us)
-        self.pwm_period_samples.append(self.pwm_period_us)
-        if len(self.pwm_high_samples) >= ENCODER_PWM_SAMPLE_COUNT:
-            high = sum(self.pwm_high_samples)
-            period = sum(self.pwm_period_samples)
-            self.absolute_count = pwm_duty_to_count(high, period)
+        high_us = self.ticks_diff(now, self.pwm_rise_us)
+        index = self.pwm_sample_index
+        if index < ENCODER_PWM_SAMPLE_COUNT:
+            self.pwm_high_samples[index] = high_us
+            self.pwm_period_samples[index] = self.pwm_period_us
+            self.pwm_sample_index = index + 1
+        if self.pwm_sample_index >= ENCODER_PWM_SAMPLE_COUNT:
+            self.stop_pwm_capture()
+            self.absolute_count = pwm_duty_to_count(
+                sum(self.pwm_high_samples), sum(self.pwm_period_samples),
+                ENCODER_COUNTS_PER_REV, ENCODER_PWM_DUTY_MIN,
+                ENCODER_PWM_DUTY_MAX, ENCODER_PWM_INVERT)
             self.pwm_valid = self.absolute_count is not None
-            self.pwm_high_samples = []
-            self.pwm_period_samples = []
 
-    def snapshot(self):
-        now = time.ticks_us()
-        if self.snapshot_us:
-            dt = time.ticks_diff(now, self.snapshot_us)
-            if dt > 0:
-                self.velocity_deg_s = encoder_count_to_angle(self.count - self.snapshot_count) * 1000000.0 / dt
-        self.snapshot_us = now
+    def stop_pwm_capture(self):
+        self.pwm_capture_active = False
+        if not self.pwm_pin_released:
+            self.pwm_pin.__del__()
+            self.pwm_pin_released = True
+
+    def set_zero_from_absolute(self, count):
+        self.absolute_zero_count = int(count) % ENCODER_COUNTS_PER_REV
+        if self.absolute_count is not None:
+            self.count = wrapped_encoder_delta(
+                self.absolute_count, self.absolute_zero_count,
+                ENCODER_COUNTS_PER_REV)
+        else:
+            self.count = 0
         self.snapshot_count = self.count
-        angle = encoder_count_to_angle(self.count)
-        if self.pwm_valid and self.absolute_zero_count is not None:
-            delta = ((self.absolute_count - self.absolute_zero_count +
-                      ENCODER_COUNTS_PER_REV // 2) % ENCODER_COUNTS_PER_REV -
-                     ENCODER_COUNTS_PER_REV // 2)
-            angle = encoder_count_to_angle(delta)
-        return {"count": self.count, "angle_deg": angle,
+
+    def snapshot(self, now_us=None):
+        if now_us is None:
+            now_us = self.ticks_us()
+        count = self.count
+        if self.snapshot_us:
+            dt = self.ticks_diff(now_us, self.snapshot_us)
+            count_delta = count - self.snapshot_count
+            if 0 < dt <= 1000000 and abs(count_delta) <= ENCODER_COUNTS_PER_REV:
+                self.velocity_deg_s = (
+                    encoder_count_to_angle(count_delta,
+                                           ENCODER_COUNTS_PER_REV) *
+                    1000000.0 / dt)
+            else:
+                self.velocity_deg_s = 0.0
+        self.snapshot_us = now_us
+        self.snapshot_count = count
+        return {"count": count,
+                "angle_deg": encoder_count_to_angle(
+                    count, ENCODER_COUNTS_PER_REV),
                 "velocity_deg_s": self.velocity_deg_s,
                 "invalid_transitions": self.invalid_transitions,
                 "z_index_count": self.z_index_count,
+                "z_seen": self.z_seen,
                 "absolute_count": self.absolute_count,
-                "pwm_valid": self.pwm_valid}
+                "pwm_valid": self.pwm_valid,
+                "last_edge_us": self.last_edge_us}
 
     def set_zero(self):
-        self.count = 0
-        self.snapshot_count = 0
-        if self.pwm_valid and self.absolute_count is not None:
-            self.absolute_zero_count = self.absolute_count
-            return self.absolute_count
-        return None
+        snapshot = self.snapshot()
+        calibration = calibrate_encoder_zero(snapshot, self.z_index_count)
+        if calibration is None:
+            return None
+        self.set_zero_from_absolute(calibration["zero_abs_count"])
+        return calibration["zero_abs_count"]
 
     def restore_absolute_zero(self, zero_abs_count):
-        if not self.pwm_valid or self.absolute_count is None:
-            return False
-        self.absolute_zero_count = int(zero_abs_count) % ENCODER_COUNTS_PER_REV
-        self.count = 0
-        self.snapshot_count = 0
-        return True
+        calibration = {
+            "version": 1, "encoder_model": "MS42CG",
+            "counts_per_rev": ENCODER_COUNTS_PER_REV,
+            "zero_abs_count": int(zero_abs_count),
+            "pwm_invert": bool(ENCODER_PWM_INVERT),
+        }
+        return restore_encoder_from_absolute(self, calibration, self.snapshot())
 
     def deinit(self):
-        try:
-            self.a_pin.irq(handler=None)
-            self.b_pin.irq(handler=None)
-            self.z_pin.irq(handler=None)
-            self.pwm_pin.irq(handler=None)
-        except Exception:
-            pass
+        self.abz_active = False
+        if not self.abz_released:
+            self.a_pin.__del__()
+            self.b_pin.__del__()
+            self.z_pin.__del__()
+            self.abz_released = True
+        self.stop_pwm_capture()
 
 def estimate_velocity(samples, ticks_diff_fn=None):
     if len(samples) < 2:
@@ -2734,9 +2852,10 @@ def detection():
         while True:
             if (saved_encoder_calibration is not None and
                     not encoder_zero_restored and encoder_runtime is not None):
-                encoder_runtime.snapshot()
-                if encoder_runtime.restore_absolute_zero(
-                        saved_encoder_calibration["zero_abs_count"]):
+                encoder_snapshot = encoder_runtime.snapshot()
+                if restore_encoder_from_absolute(
+                        encoder_runtime, saved_encoder_calibration,
+                        encoder_snapshot):
                     encoder_zero_restored = True
                     stepper_state.update({
                         "zeroed": True,
@@ -2767,15 +2886,19 @@ def detection():
                     pipe_state.get("valid", False),
                     provisional.get("valid", False), ball_stable)
                 if touch_action == "save_level_zero":
-                    zero_abs_count = None
+                    encoder_calibration = None
                     if encoder_runtime is not None:
-                        zero_abs_count = encoder_runtime.set_zero()
-                    if zero_abs_count is not None:
-                        if save_encoder_calibration(zero_abs_count):
-                            saved_encoder_calibration = {
-                                "version": ENCODER_CALIBRATION_VERSION,
-                                "zero_abs_count": zero_abs_count,
-                            }
+                        encoder_snapshot = encoder_runtime.snapshot()
+                        encoder_calibration = calibrate_encoder_zero(
+                            encoder_snapshot,
+                            encoder_runtime.z_index_count)
+                    if encoder_calibration is not None:
+                        if save_encoder_calibration(
+                                ENCODER_CALIBRATION_PATH,
+                                encoder_calibration):
+                            saved_encoder_calibration = encoder_calibration
+                            encoder_runtime.set_zero_from_absolute(
+                                encoder_calibration["zero_abs_count"])
                             encoder_zero_restored = True
                             print("MS42CG ABZ/PWM zero saved to SD")
                     else:
