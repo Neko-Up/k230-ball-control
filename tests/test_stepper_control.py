@@ -17,193 +17,98 @@ def load_function(name):
     return namespace[name]
 
 
-def base_state(now_ms=1000):
+def base_state(frequency_hz=0.0, direction=0, integral_hz=0.0):
     return {
-        "frequency_hz": 0.0,
-        "direction": 0,
-        "motion_sign": 0,
-        "estimated_angle_deg": 0.0,
-        "target_angle_deg": 0.0,
-        "last_update_ms": now_ms,
+        "integral_hz": integral_hz,
+        "frequency_hz": frequency_hz,
+        "direction": direction,
+        "last_update_ms": 0,
+        "fault": "none",
     }
 
 
 def command(**overrides):
     values = {
-        "error_cm": 0.0,
-        "velocity_cm_s": 0.0,
-        "measurement_valid": True,
-        "zeroed": True,
-        "now_ms": 1020,
+        "target_angle_deg": 0.0,
+        "actual_angle_deg": 0.0,
+        "actual_velocity_deg_s": 0.0,
+        "dt_s": 0.005,
         "state": base_state(),
-        "kp_angle_deg_per_cm": 0.18,
-        "kd_angle_deg_per_cm_s": 0.04,
-        "edge_boost_deg_per_cm2": 0.0,
-        "angle_track_hz_per_deg": 800.0,
-        "angle_tolerance_deg": 0.03,
-        "deadband_cm": 0.15,
-        "min_frequency_hz": 40.0,
-        "max_frequency_hz": 500.0,
-        "frequency_ramp_hz_s": 1500.0,
-        "pulses_per_degree": 8.8889,
-        "angle_limit_deg": 1.0,
-        "max_motion_ms": 150,
-        "direction_invert": False,
-        "ticks_diff_fn": lambda now, before: now - before,
+        "kp_hz_per_deg": 400.0,
+        "ki_hz_per_deg_s": 20.0,
+        "kd_hz_per_deg_s": 2.0,
+        "max_frequency_hz": 800.0,
+        "ramp_hz_s": 24000.0,
+        "angle_limit_deg": 16.0,
     }
     values.update(overrides)
-    return load_function("compute_stepper_command")(**values)
+    return load_function("compute_angle_pid")(**values)
 
 
-def test_deadband_stops_stepper():
-    result = command(error_cm=0.1)
+def test_positive_and_negative_angle_errors_select_direction():
+    assert command(target_angle_deg=1.0)["direction"] == 1
+    assert command(target_angle_deg=-1.0)["direction"] == -1
+
+
+def test_one_encoder_count_deadband_stops_output():
+    result = command(target_angle_deg=0.08)
     assert result["enabled"] is False
     assert result["frequency_hz"] == 0.0
-    assert result["target_angle_deg"] == 0.0
     assert result["fault"] == "angle_deadband"
 
 
-def test_position_error_selects_direction_and_ramps_frequency():
-    result = command(error_cm=1.0)
-    assert result["enabled"] is True
-    assert result["direction"] == 1
-    assert result["target_angle_deg"] == 0.18
-    assert result["frequency_hz"] == 40.0
+def test_measured_velocity_provides_derivative_braking():
+    unbraked = command(target_angle_deg=1.0, actual_velocity_deg_s=0.0,
+                       ramp_hz_s=100000.0)
+    braked = command(target_angle_deg=1.0, actual_velocity_deg_s=100.0,
+                     ramp_hz_s=100000.0)
+    assert braked["frequency_hz"] < unbraked["frequency_hz"]
 
 
-def test_derivative_damping_can_reverse_command():
-    result = command(error_cm=0.5, velocity_cm_s=10.0,
-                     frequency_ramp_hz_s=100000.0)
-    assert result["enabled"] is True
-    assert result["direction"] == -1
+def test_integral_accumulates_but_does_not_wind_up_at_saturation():
+    accumulating = command(target_angle_deg=0.5, dt_s=0.1,
+                           ramp_hz_s=100000.0)
+    assert accumulating["integral_hz"] > 0.0
+    saturated = command(target_angle_deg=16.0, dt_s=1.0,
+                        state=base_state(integral_hz=7.0),
+                        ramp_hz_s=100000.0)
+    assert saturated["frequency_hz"] == 800.0
+    assert saturated["integral_hz"] == 7.0
 
 
-def test_frequency_is_clamped_to_configured_maximum():
-    result = command(error_cm=20.0, frequency_ramp_hz_s=1000000.0)
-    assert result["target_angle_deg"] == 1.0
-    assert result["frequency_hz"] == 500.0
+def test_directional_angle_limits_block_only_outward_motion():
+    outward = command(target_angle_deg=16.0, actual_angle_deg=16.0)
+    inward = command(target_angle_deg=0.0, actual_angle_deg=16.0)
+    assert outward["enabled"] is False
+    assert outward["fault"] == "angle_limit"
+    assert inward["enabled"] is True
+    assert inward["direction"] == -1
 
 
-def test_previous_motion_is_integrated_before_new_command():
-    state = base_state()
-    state.update({"frequency_hz": 88.889, "direction": 1,
-                  "motion_sign": 1})
-    result = command(state=state, error_cm=0.0)
-    assert abs(result["estimated_angle_deg"] - 0.2) < 0.002
+def test_frequency_is_saturated_and_ramped():
+    saturated = command(target_angle_deg=10.0, ramp_hz_s=1000000.0)
+    ramped = command(target_angle_deg=10.0, ramp_hz_s=1000.0)
+    assert saturated["frequency_hz"] == 800.0
+    assert ramped["frequency_hz"] == 5.0
 
 
-def test_outward_motion_at_angle_limit_is_blocked():
-    state = base_state()
-    state["estimated_angle_deg"] = 1.0
-    result = command(state=state, error_cm=20.0)
-    assert result["enabled"] is False
-    assert result["fault"] == "angle_deadband"
+def test_reversal_decelerates_to_zero_before_switching_direction():
+    state = base_state(frequency_hz=300.0, direction=1)
+    braking = command(target_angle_deg=-1.0, state=state, dt_s=0.005)
+    assert braking["direction"] == 1
+    assert braking["frequency_hz"] == 180.0
+    assert braking["fault"] == "reversing"
+    stopped = command(target_angle_deg=-1.0, state=state, dt_s=0.020)
+    assert stopped["enabled"] is False
+    assert stopped["frequency_hz"] == 0.0
+    assert stopped["fault"] == "reversing"
 
 
-def test_inward_motion_at_angle_limit_is_allowed():
-    state = base_state()
-    state["estimated_angle_deg"] = 1.0
-    result = command(state=state, error_cm=-1.0)
-    assert result["enabled"] is True
-    assert result["direction"] == -1
-
-
-def test_invalid_or_unzeroed_state_disables_motor():
-    lost = command(measurement_valid=False)
-    assert lost["fault"] == "vision_hold"
-    assert lost["target_angle_deg"] == 0.0
-    assert command(zeroed=False)["fault"] == "not_zeroed"
-    assert lost["enabled"] is False
-    assert command(zeroed=False)["enabled"] is False
-
-
-def test_vision_loss_preserves_last_target_angle_for_holding_torque():
-    state = base_state()
-    state["target_angle_deg"] = -1.4
-    result = command(state=state, measurement_valid=False)
-    assert result["fault"] == "vision_hold"
-    assert result["target_angle_deg"] == -1.4
-
-
-def test_direction_inversion_only_changes_physical_direction():
-    normal = command(error_cm=1.0)
-    inverted = command(error_cm=1.0, direction_invert=True)
-    assert normal["direction"] == 1
-    assert inverted["direction"] == -1
-    assert normal["frequency_hz"] == inverted["frequency_hz"]
-
-
-def test_long_frame_integrates_only_watchdog_bounded_motion():
-    state = base_state()
-    state.update({"frequency_hz": 100.0, "direction": 1,
-                  "motion_sign": 1})
-    result = command(state=state, now_ms=3000, error_cm=0.0)
-    assert result["estimated_angle_deg"] == 1.0
-
-
-def test_frequency_deceleration_uses_same_ramp_limit():
-    state = base_state()
-    state.update({"frequency_hz": 300.0, "direction": 1,
-                  "motion_sign": 1})
-    result = command(state=state, error_cm=20.0)
-    assert result["frequency_hz"] == 270.0
-
-
-def test_direction_reversal_decelerates_before_switching_direction():
-    state = base_state()
-    state.update({"frequency_hz": 300.0, "direction": 1,
-                  "motion_sign": 1})
-    result = command(state=state, error_cm=-1.0)
-    assert result["direction"] == 1
-    assert result["frequency_hz"] == 270.0
-    assert result["fault"] == "reversing"
-
-
-def test_large_ball_error_clamps_target_angle_to_one_degree():
-    result = command(error_cm=20.0, frequency_ramp_hz_s=1000000.0)
-    assert result["target_angle_deg"] == 1.0
-    assert result["frequency_hz"] <= 500.0
-
-
-def test_edge_boost_requests_strong_lift_near_pipe_end():
-    result = command(
-        error_cm=12.5,
-        kp_angle_deg_per_cm=0.45,
-        kd_angle_deg_per_cm_s=0.06,
-        edge_boost_deg_per_cm2=0.06,
-        angle_limit_deg=16.0,
-        frequency_ramp_hz_s=1000000.0)
-    assert abs(result["target_angle_deg"] - 15.0) < 0.001
-
-
-def test_fast_outward_motion_at_edge_requests_full_recovery_angle():
-    result = command(
-        error_cm=12.0,
-        velocity_cm_s=-20.0,
-        kp_angle_deg_per_cm=0.55,
-        kd_angle_deg_per_cm_s=0.12,
-        edge_boost_deg_per_cm2=0.07,
-        angle_limit_deg=16.0,
-        max_frequency_hz=800.0,
-        frequency_ramp_hz_s=24000.0)
-    assert result["target_angle_deg"] == 16.0
-    assert result["frequency_hz"] > 400.0
-
-
-def test_inner_loop_tracks_target_from_estimated_angle():
-    state = base_state()
-    state["estimated_angle_deg"] = 0.8
-    result = command(state=state, error_cm=1.0,
-                     frequency_ramp_hz_s=1000000.0)
-    assert result["target_angle_deg"] == 0.18
-    assert result["direction"] == -1
-
-
-def test_ball_deadband_returns_nonlevel_rod_toward_zero():
-    state = base_state()
-    state["estimated_angle_deg"] = 0.5
-    result = command(state=state, error_cm=0.1,
-                     frequency_ramp_hz_s=1000000.0)
-    assert result["target_angle_deg"] == 0.0
-    assert result["enabled"] is True
-    assert result["direction"] == -1
+def test_production_control_never_integrates_step_frequency_into_angle():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
+    production_text = ast.unparse(tree)
+    forbidden = (
+        "previous_sign * previous_frequency * elapsed_s / pulses_per_degree",
+        "frequency_hz * elapsed_s / pulses_per_degree",
+    )
+    assert all(expression not in production_text for expression in forbidden)
