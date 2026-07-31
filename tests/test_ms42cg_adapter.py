@@ -30,7 +30,14 @@ class FakePin:
         self.level = 0
         self.callback = None
         self.trigger = None
+        self.destroyed = False
+        self.destroy_calls = 0
         FakePin.registry[pin_id] = self
+
+    def __del__(self):
+        self.callback = None
+        self.destroyed = True
+        self.destroy_calls += 1
 
     def value(self):
         return self.level
@@ -146,19 +153,21 @@ def test_snapshot_reports_angle_and_velocity_outside_irq_context():
     assert snapshot["last_edge_us"] == 0
 
 
-def test_deinit_leaves_registered_callbacks_dormant():
-    encoder, clock = new_encoder()
+def test_deinit_releases_all_irq_pins_once():
+    encoder, _ = new_encoder()
     encoder.start_abz()
     encoder.start_pwm_capture()
-    encoder.count = 10
     encoder.deinit()
-    assert callable(encoder.a_pin.callback)
-    assert callable(encoder.b_pin.callback)
-    assert callable(encoder.z_pin.callback)
-    assert callable(encoder.pwm_pin.callback)
-    set_ab(encoder, clock, 0, 1)
-    encoder.z_pin.edge(1)
-    encoder.pwm_pin.edge(1)
-    assert encoder.count == 10
-    assert encoder.z_seen is False
-    assert encoder.pwm_sample_index == 0
+    encoder.deinit()
+    assert encoder.a_pin.destroyed is True
+    assert encoder.b_pin.destroyed is True
+    assert encoder.z_pin.destroyed is True
+    assert encoder.pwm_pin.destroyed is True
+    assert encoder.a_pin.callback is None
+    assert encoder.b_pin.callback is None
+    assert encoder.z_pin.callback is None
+    assert encoder.pwm_pin.callback is None
+    assert encoder.a_pin.destroy_calls == 1
+    assert encoder.b_pin.destroy_calls == 1
+    assert encoder.z_pin.destroy_calls == 1
+    assert encoder.pwm_pin.destroy_calls == 1

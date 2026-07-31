@@ -421,7 +421,9 @@ class MS42CGEncoder:
         self.absolute_count = None
         self.pwm_valid = False
         self.abz_active = False
+        self.abz_released = False
         self.pwm_capture_active = False
+        self.pwm_pin_released = False
         self.pwm_rise_us = 0
         self.pwm_period_us = 0
         self.pwm_sample_index = 0
@@ -497,6 +499,9 @@ class MS42CGEncoder:
 
     def stop_pwm_capture(self):
         self.pwm_capture_active = False
+        if not self.pwm_pin_released:
+            self.pwm_pin.__del__()
+            self.pwm_pin_released = True
 
     def set_zero_from_absolute(self, count):
         self.absolute_zero_count = int(count) % ENCODER_COUNTS_PER_REV
@@ -538,6 +543,11 @@ class MS42CGEncoder:
 
     def deinit(self):
         self.abz_active = False
+        if not self.abz_released:
+            self.a_pin.__del__()
+            self.b_pin.__del__()
+            self.z_pin.__del__()
+            self.abz_released = True
         self.stop_pwm_capture()
 
 
