@@ -89,10 +89,8 @@ TASK3_VELOCITY_TOLERANCE_CM_S = 2.0
 # Two-step startup sequence.  The motor is disarmed until both confirmations
 # are complete; the centre is the geometric midpoint of the detected rail.
 BALANCE_WAIT_LEVEL = "WAIT_LEVEL"
-BALANCE_WAIT_CENTER = "WAIT_CENTER"
 BALANCE_ACTIVE = "ACTIVE"
 BALANCE_LEVEL_RECT = (10, 398, 250, 58)
-BALANCE_CENTER_RECT = (270, 398, 250, 58)
 BALANCE_CENTER_TOLERANCE_CM = 1.5
 OUTER_BALANCE_KP_DEG_PER_CM = 0.15
 OUTER_BALANCE_KD_DEG_PER_CM_S = 0.35
@@ -117,7 +115,7 @@ PRINT_EVERY_N_FRAMES     = 30
 GC_EVERY_N_FRAMES        = 60      # 降低强制 GC 频率，减少周期性停顿
 PERF_EVERY_N_FRAMES      = 15      # 约每0.5秒刷新实际AI帧率
 METRICS_EVERY_N_CONTROL_FRAMES = 60
-OSD_EVERY_N_FRAMES       = 1       # 控制/UART 全帧运行，叠加层每帧刷新
+OSD_EVERY_N_FRAMES       = 2       # 控制/UART 全帧运行，叠加层隔帧刷新
 DISPLAY_LABEL            = "gz"
 BALL_LABELS              = ("gangqiu", "xiaogangzhu")
 MERGED_CLASS_ID          = 0       # 新模型只有 gangqiu 一个类
@@ -259,7 +257,6 @@ task3_state = None
 balance_workflow_state = {
     "mode": BALANCE_WAIT_LEVEL,
     "level_confirmed": False,
-    "center_confirmed": False,
     "center_param": 0.5,
     "touch_latched": False,
 }
@@ -723,6 +720,11 @@ class RodCascadeController:
                 visual_age > STEPPER_VISION_TIMEOUT_MS):
             self._stop_fault("VISION TIMEOUT", disable=False)
             return
+        effective_target_angle = self.target_angle_deg
+        if visual_age > 80:
+            remaining_ms = max(0, STEPPER_VISION_TIMEOUT_MS - visual_age)
+            effective_target_angle *= remaining_ms / float(
+                STEPPER_VISION_TIMEOUT_MS - 80)
         if (self.control_rate_hz > 0.0 and
                 self.control_rate_hz < CASCADE_MIN_RATE_HZ):
             self._stop_fault("CTRL SLOW", disable=True)
@@ -734,7 +736,7 @@ class RodCascadeController:
             return
         self.last_invalid_transitions = invalid_transitions
         actual_angle = float(snapshot["angle_deg"])
-        angle_error = self.target_angle_deg - actual_angle
+        angle_error = effective_target_angle - actual_angle
         last_edge_us = snapshot["last_edge_us"]
         edge_age_us = (self.ticks_diff(now_us, last_edge_us)
                        if last_edge_us else 0)
@@ -757,7 +759,7 @@ class RodCascadeController:
                 self._stop_fault("ENC MISMATCH", disable=True)
                 return
         command = compute_angle_pid(
-            self.target_angle_deg, actual_angle,
+            effective_target_angle, actual_angle,
             snapshot["velocity_deg_s"], dt_s, self.pid_state,
             INNER_KP_HZ_PER_DEG, INNER_KI_HZ_PER_DEG_S,
             INNER_KD_HZ_PER_DEG_S, STEPPER_MAX_FREQUENCY_HZ,
@@ -826,11 +828,23 @@ def format_ball_telemetry(measurement, vision_fps):
             "AI:{:.1f}FPS".format(max(0.0, float(vision_fps))))
 
 
+def format_edge_telemetry(edge_state):
+    if edge_state == "EDGE RESCUE":
+        return "EDGE RESCUE"
+    if edge_state == "EDGE WARN":
+        return "EDGE WARN"
+    return "EDGE OK"
+
+
+def format_edge_msg(edge_state):
+    return ("Q:{}\n".format(format_edge_telemetry(edge_state))
+            .encode("utf-8"))
+
+
 def new_balance_workflow_state():
     return {
         "mode": BALANCE_WAIT_LEVEL,
         "level_confirmed": False,
-        "center_confirmed": False,
         "center_param": 0.5,
         "touch_latched": False,
     }
@@ -844,7 +858,7 @@ def _point_in_rect(point, rect):
     return rx <= x < rx + rw and ry <= y < ry + rh and event == TOUCH_RELEASE_EVENT
 
 
-def balance_touch_transition(state, point, level_rect, center_rect,
+def balance_touch_transition(state, point, level_rect,
                              pipe_valid, ball_valid, ball_stable):
     """Pure two-button state transition used by the CanMV touch loop."""
     next_state = dict(state)
@@ -859,13 +873,6 @@ def balance_touch_transition(state, point, level_rect, center_rect,
         next_state["mode"] = BALANCE_ACTIVE
         next_state["level_confirmed"] = True
         return next_state, "save_level_zero"
-    if (next_state.get("mode") == BALANCE_WAIT_CENTER and
-            next_state.get("level_confirmed") and pipe_valid and ball_valid and
-            ball_stable and _point_in_rect(point, center_rect)):
-        next_state["mode"] = BALANCE_ACTIVE
-        next_state["center_confirmed"] = True
-        next_state["center_param"] = 0.5
-        return next_state, "save_center"
     return next_state, None
 
 
@@ -2747,9 +2754,13 @@ def update_stepper_control(measurement, cascade_controller,
             ball_filter_state = None
     edge_rescue = outer_balance_state.get("edge_state") == "EDGE RESCUE"
     command_valid = vision_fresh or edge_rescue
-    cascade_controller.set_visual_target(
-        target_angle, now_ms if edge_rescue else control_timestamp_ms,
-        command_valid)
+    if command_valid:
+        cascade_controller.set_visual_target(
+            target_angle, now_ms if edge_rescue else control_timestamp_ms,
+            True)
+    elif age_ms > STEPPER_VISION_TIMEOUT_MS:
+        cascade_controller.set_visual_target(
+            0.0, control_timestamp_ms, False)
     status = cascade_controller.status(now_ms)
     status["edge_state"] = outer_balance_state.get("edge_state", "NORMAL")
     status["predicted_position_cm"] = outer_balance_state.get(
@@ -2808,6 +2819,11 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
             osd_img.draw_string_advanced(
                 10, 10 + line_index * 22, 16,
                 telemetry_line, color=C_WHITE)
+        edge_line = format_edge_telemetry(
+            stepper_state.get("edge_state", "NORMAL"))
+        osd_img.draw_string_advanced(
+            10, 78, 18, edge_line,
+            color=C_RED if edge_line != "EDGE OK" else C_GREEN_TEXT)
 
     mode = balance_workflow_state.get("mode", BALANCE_WAIT_LEVEL)
     calibration = cal_state.get("calibration")
@@ -2970,6 +2986,8 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
             current_deviation["dy"],
             current_deviation["valid"]))
         uart_obj.write(format_stepper_msg(stepper_state))
+        uart_obj.write(format_edge_msg(
+            stepper_state.get("edge_state", "NORMAL")))
 
     # ---- 调试打印 ----
     if frame_counter % PRINT_EVERY_N_FRAMES == 0:
@@ -3101,7 +3119,7 @@ def detection():
         tp = TOUCH(0)
         touch_poll_counter = 0
         if saved_encoder_calibration is None:
-            print("Touch sequence: LEVEL CONFIRM -> CENTER CONFIRM")
+            print("Touch LEVEL CONFIRM after PWM absolute angle is valid")
         else:
             print("Level auto-restored; centre target is geometric midpoint")
 
@@ -3160,11 +3178,12 @@ def detection():
                                TASK3_VELOCITY_TOLERANCE_CM_S)
                 balance_workflow_state, touch_action = balance_touch_transition(
                     balance_workflow_state, touch_point,
-                    BALANCE_LEVEL_RECT, BALANCE_CENTER_RECT,
+                    BALANCE_LEVEL_RECT,
                     pipe_state.get("valid", False),
                     provisional.get("valid", False), ball_stable)
                 if touch_action == "save_level_zero":
                     encoder_calibration = None
+                    encoder_calibration_saved = False
                     if encoder_runtime is not None:
                         encoder_snapshot = encoder_runtime.snapshot()
                         encoder_calibration = calibrate_encoder_zero(
@@ -3174,6 +3193,7 @@ def detection():
                         if save_encoder_calibration(
                                 ENCODER_CALIBRATION_PATH,
                                 encoder_calibration):
+                            encoder_calibration_saved = True
                             saved_encoder_calibration = encoder_calibration
                             encoder_runtime.set_zero_from_absolute(
                                 encoder_calibration["zero_abs_count"])
@@ -3181,14 +3201,19 @@ def detection():
                             cascade_controller.arm(
                                 encoder_calibration["zero_abs_count"])
                             print("MS42CG ABZ/PWM zero saved to SD")
-                    else:
-                        print("PWM angle not ready; zero is session-only",
+                            save_rod_level_calibration(
+                                ROD_LEVEL_CALIBRATION_PATH, 0.0)
+                            print("Rail level confirmed; geometric centre control armed")
+                    if not encoder_calibration_saved:
+                        balance_workflow_state.update({
+                            "mode": BALANCE_WAIT_LEVEL,
+                            "level_confirmed": False,
+                        })
+                        cascade_controller.disarm("PWM INVALID")
+                        print("PWM angle invalid; control remains disarmed",
                               "valid=", getattr(encoder_runtime, "pwm_valid", False),
                               "abs=", getattr(encoder_runtime, "absolute_count", None))
                     stepper_state = cascade_controller.status(time.ticks_ms())
-                    save_rod_level_calibration(
-                        ROD_LEVEL_CALIBRATION_PATH, 0.0)
-                    print("Rail level confirmed; geometric centre control armed")
                 touch_poll_counter = 0
             with ScopedTiming("total", debug_mode > 0):
                 dynamic_roi = ball_tracking_roi(

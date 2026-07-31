@@ -120,6 +120,21 @@ def test_stale_visual_target_stops_motion():
     assert stepper.stops[-1] is False
 
 
+def test_visual_loss_holds_80ms_then_ramps_level_before_timeout():
+    controller, encoder, stepper, clock = new_controller()
+    controller.set_visual_target(2.0, clock["ms"], True)
+    clock["ms"] += 50
+    clock["us"] += 50000
+    encoder.data["last_edge_us"] = clock["us"]
+    controller.tick(None)
+    assert stepper.commands[-1]["target_angle_deg"] == 2.0
+    clock["ms"] += 50
+    clock["us"] += 50000
+    encoder.data["last_edge_us"] = clock["us"]
+    controller.tick(None)
+    assert 0.0 < stepper.commands[-1]["target_angle_deg"] < 2.0
+
+
 def test_commanded_motion_without_encoder_edges_faults():
     controller, encoder, stepper, clock = new_controller()
     controller.set_visual_target(2.0, clock["ms"], True)
