@@ -46,8 +46,8 @@ else:
     DISPLAY_WIDTH  = ALIGN_UP(1920, 16)
     DISPLAY_HEIGHT = 1080
 
-OUT_RGB888P_WIDTH  = ALIGN_UP(640, 16)
-OUT_RGB888P_HEIGH  = 360
+OUT_RGB888P_WIDTH  = ALIGN_UP(320, 16)
+OUT_RGB888P_HEIGH  = 320
 
 GEOM_CENTER_X = OUT_RGB888P_WIDTH // 2
 GEOM_CENTER_Y = OUT_RGB888P_HEIGH // 2
@@ -92,15 +92,15 @@ MAX_TRACKS               = 12
 MAX_DETECTIONS_PER_FRAME = 25
 PRINT_EVERY_N_FRAMES     = 30
 GC_EVERY_N_FRAMES        = 60      # 降低强制 GC 频率，减少周期性停顿
-PERF_EVERY_N_FRAMES      = 60      # 低频统计实际 AI 主循环性能
+PERF_EVERY_N_FRAMES      = 15      # 约每0.5秒刷新实时AI帧率
 METRICS_EVERY_N_CONTROL_FRAMES = 60
 OSD_EVERY_N_FRAMES       = 1       # 控制/UART 全帧运行，叠加层每帧刷新
 DISPLAY_LABEL            = "gz"
 MERGED_CLASS_ID          = 0       # 新模型只有 gangqiu 一个类
 MIN_BOX_SIZE             = 4
-MAX_BOX_SIZE             = 170
+MAX_BOX_SIZE             = 85
 MAX_ASPECT_RATIO         = 1.8
-AI_ROD_ROI               = (0, 110, 640, 140)
+AI_ROD_ROI               = (0, 98, 320, 124)
 DEDUP_IOU_THRESHOLD      = 0.35
 DEDUP_CENTER_RATIO       = 0.55
 TRACK_MERGE_IOU_THRESHOLD = 0.25
@@ -108,22 +108,22 @@ TRACK_MERGE_CENTER_RATIO  = 0.75
 PREDICTION_HORIZON_MS     = 35
 PREDICTION_MIN_MS         = 20
 PREDICTION_MAX_MS         = 40
-PREDICTION_MAX_SHIFT_PX   = 16
-MOTION_RESET_JUMP_PX      = 48
+PREDICTION_MAX_SHIFT_PX   = 8
+MOTION_RESET_JUMP_PX      = 24
 VELOCITY_REVERSAL_MIN_SPEED = 0.01
 BLOB_THRESHOLDS           = [(0, 70, -20, 20, -20, 20)]
-BLOB_GLOBAL_ROI           = (0, 110, 640, 140)
-BLOB_ROI_HALF_WIDTH       = 96
-BLOB_MIN_PIXELS           = 40
-BLOB_MAX_PIXELS           = 1600
+BLOB_GLOBAL_ROI           = (0, 98, 320, 124)
+BLOB_ROI_HALF_WIDTH       = 48
+BLOB_MIN_PIXELS           = 18
+BLOB_MAX_PIXELS           = 711
 BLOB_MAX_ASPECT_RATIO     = 1.8
-BLOB_MAX_CENTER_DISTANCE  = 80
+BLOB_MAX_CENTER_DISTANCE  = 40
 PIPE_GREEN_THRESHOLDS     = [(30, 85, -70, -8, -25, 45)]
-PIPE_GLOBAL_ROI           = (0, 70, 640, 220)
-PIPE_MIN_PIXELS           = 1200
-PIPE_MIN_LENGTH_PX        = 180.0
+PIPE_GLOBAL_ROI           = (0, 62, 320, 196)
+PIPE_MIN_PIXELS           = 533
+PIPE_MIN_LENGTH_PX        = 90.0
 PIPE_MIN_ASPECT_RATIO     = 3.0
-PIPE_MAX_WIDTH_PX         = 72.0
+PIPE_MAX_WIDTH_PX         = 64.0
 PIPE_MIN_FILL_RATIO       = 0.45
 PIPE_LENGTH_CM            = 25.0
 PIPE_HOLD_MISSES          = 3
@@ -136,7 +136,7 @@ AI_VALIDATE_INTERVAL      = 6
 BLOB_LOST_TO_RECOVER      = 2
 AI_FAILURES_TO_RECOVER    = 2
 PREDICT_ONLY_MAX_FRAMES   = 1
-AI_BLOB_IDENTITY_MAX_DISTANCE = 80
+AI_BLOB_IDENTITY_MAX_DISTANCE = 40
 
 # ============================================================
 # 中值滤波
@@ -224,6 +224,7 @@ kpu_total_ms = 0
 blob_loss_count = 0
 kpu_reacquire_count = 0
 prediction_clamp_count = 0
+runtime_telemetry = {"vision_fps": 0.0}
 
 
 # ============================================================
@@ -311,6 +312,28 @@ def estimate_velocity(samples, ticks_diff_fn=None):
     return (
         sum(item[0] for item in velocities) / len(velocities),
         sum(item[1] for item in velocities) / len(velocities),
+    )
+
+
+def compute_window_fps(frame_count, elapsed_ms):
+    if elapsed_ms <= 0:
+        return 0.0
+    return float(frame_count) * 1000.0 / float(elapsed_ms)
+
+
+def format_ball_telemetry(measurement, vision_fps):
+    if measurement.get("valid", False):
+        position_line = "P:{:+.2f}cm".format(
+            measurement.get("ball_position_cm", 0.0))
+        velocity_line = "BV:{:+.1f}cm/s".format(
+            measurement.get("velocity_cm_s", 0.0))
+    else:
+        position_line = "P:--cm"
+        velocity_line = "BV:--cm/s"
+    return (
+        position_line,
+        velocity_line,
+        "AI:{:.1f}FPS".format(max(0.0, float(vision_fps))),
     )
 
 
@@ -590,7 +613,7 @@ class RodCascadeController:
         self.timer = factory(CASCADE_TIMER_ID)
         self.timer.init(
             mode=Timer.PERIODIC, period=CASCADE_PERIOD_MS,
-            callback=self.tick, hard=False)
+            callback=self.tick)
 
     def set_visual_target(self, angle_deg, timestamp_ms, valid):
         self.target_angle_deg = max(
@@ -2362,6 +2385,16 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
             color=C_WHITE if ball_valid else C_RED)
         osd_img.draw_string_advanced(
             10, 34, 18, "s:{:.2f}".format(best_score), color=C_WHITE)
+        position_line, velocity_line, fps_line = format_ball_telemetry(
+            measurement, runtime_telemetry["vision_fps"])
+        osd_img.draw_string_advanced(
+            DISPLAY_WIDTH - 240, 10, 20, position_line,
+            color=C_GREEN_TEXT if measurement["valid"] else C_RED)
+        osd_img.draw_string_advanced(
+            DISPLAY_WIDTH - 240, 36, 18, velocity_line,
+            color=C_GREEN_TEXT if measurement["valid"] else C_RED)
+        osd_img.draw_string_advanced(
+            10, 58, 18, fps_line, color=C_WHITE)
         geometry = pipe_state.get("geometry")
         if pipe_state.get("valid") and geometry is not None:
             draw_dynamic_pipe(osd_img, geometry, C_PIPE)
@@ -2407,11 +2440,7 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
             osd_img.draw_string_advanced(
                 target_dx - 8, target_dy - 32, 18, "T", color=C_WHITE)
             osd_img.draw_string_advanced(
-                DISPLAY_WIDTH - 240, 10, 22,
-                "O:{:+.2f}cm".format(measurement["ball_position_cm"]),
-                color=C_GREEN_TEXT if measurement["valid"] else C_RED)
-            osd_img.draw_string_advanced(
-                DISPLAY_WIDTH - 240, 36, 20,
+                10, 82, 18,
                 "|O-B|:{:.2f}cm".format(
                     abs(measurement["ball_position_cm"])),
                 color=C_GREEN_TEXT)
@@ -2513,6 +2542,9 @@ def detection():
     kmodel_name   = deploy_conf["kmodel_path"]
     nms_threshold = deploy_conf["nms_threshold"]
     img_size      = deploy_conf["img_size"]
+    if list(img_size) != [320, 320]:
+        raise ValueError(
+            "kmodel input must be 320x320, got {}".format(img_size))
     num_classes   = deploy_conf["num_classes"]
     color_four    = get_colors(num_classes)
     nms_option    = deploy_conf["nms_option"]
@@ -2863,8 +2895,11 @@ def detection():
                         perf_elapsed_ms = time.ticks_diff(
                             perf_now_ms, perf_start_ms)
                         if perf_elapsed_ms > 0:
+                            runtime_telemetry["vision_fps"] = (
+                                compute_window_fps(
+                                    perf_frame_count, perf_elapsed_ms))
                             print("AI FPS:{:.1f} avg:{:.1f}ms".format(
-                                perf_frame_count * 1000.0 / perf_elapsed_ms,
+                                runtime_telemetry["vision_fps"],
                                 perf_elapsed_ms * 1.0 / perf_frame_count))
                         perf_start_ms = perf_now_ms
                         perf_frame_count = 0

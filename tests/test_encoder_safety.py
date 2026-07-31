@@ -29,6 +29,8 @@ class FakeTimer:
         self.deinitialized = False
 
     def init(self, **kwargs):
+        if "hard" in kwargs:
+            raise TypeError("extra keyword arguments given")
         self.kwargs = kwargs
 
     def deinit(self):
@@ -107,7 +109,7 @@ def test_controller_owns_single_5ms_soft_timer():
     assert controller.timer.kwargs["mode"] == FakeTimer.PERIODIC
     assert controller.timer.kwargs["period"] == 5
     assert controller.timer.kwargs["callback"] == controller.tick
-    assert controller.timer.kwargs["hard"] is False
+    assert "hard" not in controller.timer.kwargs
 
 
 def test_stale_visual_target_stops_motion():
@@ -169,4 +171,3 @@ def test_valid_feedback_applies_real_angle_pid_and_can_recover():
     tick(controller, clock)
     assert stepper.commands[-1]["enabled"] is False
     assert controller.status(clock["ms"])["fault"] == "angle_deadband"
-
