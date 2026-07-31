@@ -46,8 +46,8 @@ else:
     DISPLAY_WIDTH  = ALIGN_UP(1920, 16)
     DISPLAY_HEIGHT = 1080
 
-OUT_RGB888P_WIDTH  = ALIGN_UP(640, 16)
-OUT_RGB888P_HEIGH  = 360
+OUT_RGB888P_WIDTH  = ALIGN_UP(320, 16)
+OUT_RGB888P_HEIGH  = 320
 
 GEOM_CENTER_X = OUT_RGB888P_WIDTH // 2
 GEOM_CENTER_Y = OUT_RGB888P_HEIGH // 2
@@ -115,16 +115,16 @@ MAX_TRACKS               = 12
 MAX_DETECTIONS_PER_FRAME = 25
 PRINT_EVERY_N_FRAMES     = 30
 GC_EVERY_N_FRAMES        = 60      # 降低强制 GC 频率，减少周期性停顿
-PERF_EVERY_N_FRAMES      = 60      # 低频统计实际 AI 主循环性能
+PERF_EVERY_N_FRAMES      = 15      # 约每0.5秒刷新实际AI帧率
 METRICS_EVERY_N_CONTROL_FRAMES = 60
 OSD_EVERY_N_FRAMES       = 1       # 控制/UART 全帧运行，叠加层每帧刷新
 DISPLAY_LABEL            = "gz"
 BALL_LABELS              = ("gangqiu", "xiaogangzhu")
 MERGED_CLASS_ID          = 0       # 新模型只有 gangqiu 一个类
 MIN_BOX_SIZE             = 4
-MAX_BOX_SIZE             = 260
-MAX_ASPECT_RATIO         = 3.0
-AI_ROD_ROI               = (0, 40, 640, 280)
+MAX_BOX_SIZE             = 85
+MAX_ASPECT_RATIO         = 1.8
+AI_ROD_ROI               = (0, 98, 320, 124)
 DEDUP_IOU_THRESHOLD      = 0.35
 DEDUP_CENTER_RATIO       = 0.55
 TRACK_MERGE_IOU_THRESHOLD = 0.25
@@ -132,36 +132,36 @@ TRACK_MERGE_CENTER_RATIO  = 0.75
 PREDICTION_HORIZON_MS     = 35
 PREDICTION_MIN_MS         = 20
 PREDICTION_MAX_MS         = 40
-PREDICTION_MAX_SHIFT_PX   = 16
-MOTION_RESET_JUMP_PX      = 48
+PREDICTION_MAX_SHIFT_PX   = 8
+MOTION_RESET_JUMP_PX      = 24
 VELOCITY_REVERSAL_MIN_SPEED = 0.01
 BLOB_THRESHOLDS           = [(0, 70, -20, 20, -20, 20)]
-BLOB_GLOBAL_ROI           = (0, 40, 640, 280)
-BLOB_ROI_HALF_WIDTH       = 160
-BLOB_MIN_PIXELS           = 40
-BLOB_MAX_PIXELS           = 1600
+BLOB_GLOBAL_ROI           = (0, 98, 320, 124)
+BLOB_ROI_HALF_WIDTH       = 48
+BLOB_MIN_PIXELS           = 18
+BLOB_MAX_PIXELS           = 711
 BLOB_MAX_ASPECT_RATIO     = 1.8
-BLOB_MAX_CENTER_DISTANCE  = 80
-BALL_DISPLAY_BOX_SIZE     = 72      # 仅用于显示，固定大框；不改变控制中心
+BLOB_MAX_CENTER_DISTANCE  = 40
+BALL_DISPLAY_BOX_SIZE     = 36      # 仅用于显示，不改变控制中心
 PIPE_GREEN_THRESHOLDS     = [(30, 85, -70, -8, -25, 45)]
-PIPE_GLOBAL_ROI           = (0, 70, 640, 220)
-PIPE_MIN_PIXELS           = 1200
-PIPE_MIN_LENGTH_PX        = 120.0
+PIPE_GLOBAL_ROI           = (0, 62, 320, 196)
+PIPE_MIN_PIXELS           = 533
+PIPE_MIN_LENGTH_PX        = 90.0
 PIPE_MIN_ASPECT_RATIO     = 3.0
-PIPE_MAX_WIDTH_PX         = 140.0
+PIPE_MAX_WIDTH_PX         = 64.0
 PIPE_MIN_FILL_RATIO       = 0.45
 PIPE_LENGTH_CM            = 25.0
 PIPE_HOLD_MISSES          = 3
 PIPE_SMOOTH_ALPHA         = 0.85
-PIPE_LOCK_FIRST           = False
+PIPE_LOCK_FIRST           = 5
 TRACK_SEARCH              = "SEARCH"
 TRACK_ACTIVE              = "TRACK"
 TRACK_RECOVER             = "RECOVER"
-AI_VALIDATE_INTERVAL      = 6
+AI_VALIDATE_INTERVAL      = 3
 BLOB_LOST_TO_RECOVER      = 2
 AI_FAILURES_TO_RECOVER    = 2
 PREDICT_ONLY_MAX_FRAMES   = 1
-AI_BLOB_IDENTITY_MAX_DISTANCE = 80
+AI_BLOB_IDENTITY_MAX_DISTANCE = 40
 
 # ============================================================
 # 中值滤波
@@ -244,6 +244,7 @@ pipe_state = {
     "geometry": None,
     "misses": 0,
     "locked": False,
+    "stable_observations": 0,
 }
 last_yolo_pipe_geometry = None
 motion_samples = []
@@ -269,6 +270,7 @@ outer_balance_state = {
     "last_edge_side": 0, "last_valid_ms": -1000,
     "edge_state": "NORMAL", "last_update_ms": 0,
 }
+runtime_telemetry = {"vision_fps": 0.0}
 
 
 # ============================================================
@@ -805,6 +807,25 @@ def estimate_velocity(samples, ticks_diff_fn=None):
     )
 
 
+def compute_window_fps(frame_count, elapsed_ms):
+    if elapsed_ms <= 0:
+        return 0.0
+    return float(frame_count) * 1000.0 / float(elapsed_ms)
+
+
+def format_ball_telemetry(measurement, vision_fps):
+    if measurement.get("valid", False):
+        position_line = "P:{:+.2f}cm".format(
+            measurement.get("ball_position_cm", 0.0))
+        velocity_line = "BV:{:+.1f}cm/s".format(
+            measurement.get("velocity_cm_s", 0.0))
+    else:
+        position_line = "P:--cm"
+        velocity_line = "BV:--cm/s"
+    return (position_line, velocity_line,
+            "AI:{:.1f}FPS".format(max(0.0, float(vision_fps))))
+
+
 def new_balance_workflow_state():
     return {
         "mode": BALANCE_WAIT_LEVEL,
@@ -1152,16 +1173,58 @@ def apply_kpu_validation_anchor(published_control, blob_x, blob_y,
     )
 
 
-def hybrid_frame_actions(state, frame_number, blob_available, blob_valid=True):
+def hybrid_frame_actions(state, frame_number, blob_available, blob_valid=True,
+                         force_global=False):
     if not blob_available:
         return ("kpu",)
     if state != TRACK_ACTIVE:
         return ("kpu",)
     if not blob_valid:
         return ("kpu",)
+    if force_global:
+        return ("blob_control", "kpu")
     if frame_number % AI_VALIDATE_INTERVAL == 0:
         return ("blob_control", "kpu")
     return ("blob_control",)
+
+
+def should_validate_pipe(frame_number, locked):
+    return (not bool(locked)) or int(frame_number) % 10 == 0
+
+
+def ball_tracking_roi(center_x, center_y, recovery=False,
+                      frame_width=320, frame_height=320):
+    size = 128 if recovery else 96
+    roi_x = int(round(float(center_x))) - size // 2
+    roi_y = int(round(float(center_y))) - size // 2
+    roi_x = max(0, min(int(frame_width) - size, roi_x))
+    roi_y = max(0, min(int(frame_height) - size, roi_y))
+    return roi_x, roi_y, size, size
+
+
+def should_force_global_kpu(position_cm, velocity_cm_s):
+    position_cm = float(position_cm)
+    velocity_cm_s = float(velocity_cm_s)
+    edge_side = 1.0 if position_cm >= 0.0 else -1.0
+    outward_speed = max(0.0, edge_side * velocity_cm_s)
+    predicted = (position_cm + velocity_cm_s * 0.18 +
+                 edge_side * outward_speed * outward_speed / 200.0)
+    return abs(position_cm) >= 10.0 or abs(predicted) >= 10.0
+
+
+def should_run_kpu_validation(frame_number, position_cm, velocity_cm_s):
+    position_cm = float(position_cm)
+    velocity_cm_s = float(velocity_cm_s)
+    edge_side = 1.0 if position_cm >= 0.0 else -1.0
+    outward_speed = max(0.0, edge_side * velocity_cm_s)
+    predicted = (position_cm + velocity_cm_s * 0.18 +
+                 edge_side * outward_speed * outward_speed / 200.0)
+    at_edge = abs(position_cm) >= 10.0 or abs(predicted) >= 10.0
+    return at_edge or int(frame_number) % 3 == 0
+
+
+def clamp_ball_prediction_cm(position_cm):
+    return max(-12.5, min(12.5, float(position_cm)))
 
 
 def prediction_for_missed_frame(current_state, predicted_frames, now_ms):
@@ -1295,6 +1358,8 @@ def update_pipe_geometry_state(previous, observation,
             "geometry": previous["geometry"],
             "misses": 0,
             "locked": True,
+            "stable_observations": int(previous.get(
+                "stable_observations", 1)),
         }
     if observation is None:
         misses = int(previous.get("misses", 0)) + 1
@@ -1304,6 +1369,8 @@ def update_pipe_geometry_state(previous, observation,
             "geometry": previous.get("geometry"),
             "misses": misses,
             "locked": bool(previous.get("locked", False)),
+            "stable_observations": int(previous.get(
+                "stable_observations", 0)),
         }
     geometry = observation
     previous_geometry = previous.get("geometry")
@@ -1320,11 +1387,17 @@ def update_pipe_geometry_state(previous, observation,
         blended = pipe_geometry_from_corners(blended_corners)
         if blended is not None:
             geometry = blended
+    required_observations = (1 if lock_first is True else
+                             max(0, int(lock_first or 0)))
+    stable_observations = int(previous.get("stable_observations", 0)) + 1
+    locked = (required_observations > 0 and
+              stable_observations >= required_observations)
     return {
         "valid": True,
         "geometry": geometry,
         "misses": 0,
-        "locked": bool(lock_first),
+        "locked": locked,
+        "stable_observations": stable_observations,
     }
 
 
@@ -2729,6 +2802,12 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
     best_score = capture["score"] if capture is not None else 0.0
     if render_osd:
         draw_tracking_marker(osd_img, control_state, tracker_state)
+        telemetry_lines = format_ball_telemetry(
+            measurement, runtime_telemetry["vision_fps"])
+        for line_index, telemetry_line in enumerate(telemetry_lines):
+            osd_img.draw_string_advanced(
+                10, 10 + line_index * 22, 16,
+                telemetry_line, color=C_WHITE)
 
     mode = balance_workflow_state.get("mode", BALANCE_WAIT_LEVEL)
     calibration = cal_state.get("calibration")
@@ -3112,7 +3191,9 @@ def detection():
                     print("Rail level confirmed; geometric centre control armed")
                 touch_poll_counter = 0
             with ScopedTiming("total", debug_mode > 0):
-                dynamic_roi = blob_tracking_roi(roi_anchor["x"])
+                dynamic_roi = ball_tracking_roi(
+                    roi_anchor["x"], roi_anchor["y"],
+                    tracker_state == TRACK_RECOVER)
                 blob_capture = None
                 pipe_observation = last_yolo_pipe_geometry
                 last_yolo_pipe_geometry = None
@@ -3125,7 +3206,9 @@ def detection():
                             sensor, True,
                             dynamic_roi,
                             roi_anchor["x"], roi_anchor["y"],
-                            not pipe_state.get("locked", False)))
+                            should_validate_pipe(
+                                frame_counter + 1,
+                                pipe_state.get("locked", False))))
                     blob_frame_count += 1
                     blob_total_ms += time.ticks_diff(
                         time.ticks_ms(), blob_start_ms)
@@ -3147,7 +3230,10 @@ def detection():
                     blob_misses += 1
                 actions = hybrid_frame_actions(
                     tracker_state, frame_counter + 1,
-                    blob_channel_available, blob_valid)
+                    blob_channel_available, blob_valid,
+                    should_force_global_kpu(
+                        current_deviation.get("position_cm", 0.0),
+                        current_deviation.get("velocity_cm_s", 0.0)))
                 blob_measurement_x = None
                 blob_measurement_y = None
                 ai_valid = False
@@ -3330,8 +3416,11 @@ def detection():
                         perf_elapsed_ms = time.ticks_diff(
                             perf_now_ms, perf_start_ms)
                         if perf_elapsed_ms > 0:
+                            runtime_telemetry["vision_fps"] = (
+                                compute_window_fps(
+                                    perf_frame_count, perf_elapsed_ms))
                             print("AI FPS:{:.1f} avg:{:.1f}ms".format(
-                                perf_frame_count * 1000.0 / perf_elapsed_ms,
+                                runtime_telemetry["vision_fps"],
                                 perf_elapsed_ms * 1.0 / perf_frame_count))
                         perf_start_ms = perf_now_ms
                         perf_frame_count = 0
