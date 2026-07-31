@@ -263,6 +263,12 @@ balance_workflow_state = {
     "touch_latched": False,
 }
 encoder_runtime = None
+ball_filter_state = None
+outer_balance_state = {
+    "integral_deg": 0.0, "last_target_deg": 0.0,
+    "last_edge_side": 0, "last_valid_ms": -1000,
+    "edge_state": "NORMAL", "last_update_ms": 0,
+}
 
 
 # ============================================================
@@ -842,15 +848,137 @@ def balance_touch_transition(state, point, level_rect, center_rect,
     return next_state, None
 
 
-def compute_outer_balance_target(error_cm, velocity_cm_s,
-                                kp_deg_per_cm, kd_deg_per_cm_s,
-                                angle_limit_deg):
-    """Outer position/velocity PD; velocity term brakes the ball's inertia."""
-    if abs(float(error_cm)) <= OUTER_BALANCE_DEADBAND_CM and abs(float(velocity_cm_s)) < 0.8:
-        return 0.0
-    target = (float(kp_deg_per_cm) * float(error_cm) -
-              float(kd_deg_per_cm_s) * float(velocity_cm_s))
-    return max(-float(angle_limit_deg), min(float(angle_limit_deg), target))
+def alpha_beta_update(state, position_cm, timestamp_ms, alpha=0.72, beta=0.22,
+                      max_jump_cm=4.0, max_velocity_cm_s=80.0,
+                      max_acceleration_cm_s2=400.0):
+    """Filter ball position and estimate velocity using the real frame time."""
+    position_cm = float(position_cm)
+    timestamp_ms = int(timestamp_ms)
+    if state is None:
+        return {"position_cm": position_cm, "velocity_cm_s": 0.0,
+                "timestamp_ms": timestamp_ms}
+    elapsed_ms = timestamp_ms - int(state.get("timestamp_ms", timestamp_ms))
+    if elapsed_ms <= 0 or elapsed_ms > 500:
+        return {"position_cm": position_cm, "velocity_cm_s": 0.0,
+                "timestamp_ms": timestamp_ms}
+    dt_s = elapsed_ms / 1000.0
+    previous_position = float(state.get("position_cm", position_cm))
+    previous_velocity = float(state.get("velocity_cm_s", 0.0))
+    measured_jump = position_cm - previous_position
+    if abs(measured_jump) > float(max_jump_cm):
+        position_cm = previous_position + (
+            float(max_jump_cm) if measured_jump > 0.0 else -float(max_jump_cm))
+    predicted_position = previous_position + previous_velocity * dt_s
+    residual = position_cm - predicted_position
+    filtered_position = predicted_position + float(alpha) * residual
+    candidate_velocity = previous_velocity + float(beta) * residual / dt_s
+    max_velocity_delta = float(max_acceleration_cm_s2) * dt_s
+    velocity_delta = candidate_velocity - previous_velocity
+    if abs(velocity_delta) > max_velocity_delta:
+        candidate_velocity = previous_velocity + (
+            max_velocity_delta if velocity_delta > 0.0 else -max_velocity_delta)
+    filtered_velocity = max(
+        -float(max_velocity_cm_s),
+        min(float(max_velocity_cm_s), candidate_velocity))
+    return {"position_cm": filtered_position,
+            "velocity_cm_s": filtered_velocity,
+            "timestamp_ms": timestamp_ms}
+
+
+def compute_outer_balance_target(
+        error_cm, velocity_cm_s, dt_s, state, position_cm,
+        measurement_valid=True, now_ms=0):
+    """Return a safe rod target and state with predictive edge protection."""
+    next_state = dict(state) if state is not None else {}
+    next_state.setdefault("integral_deg", 0.0)
+    next_state.setdefault("last_target_deg", 0.0)
+    next_state.setdefault("last_edge_side", 0)
+    next_state.setdefault("last_valid_ms", -1000)
+    next_state.setdefault("edge_state", "NORMAL")
+    dt_s = max(0.0, min(float(dt_s), 0.1))
+    error_cm = float(error_cm)
+    velocity_cm_s = float(velocity_cm_s)
+    position_cm = float(position_cm)
+    now_ms = int(now_ms)
+
+    # A ball that disappears at an end must never be guessed onto the other
+    # side.  Continue the last known inward rescue for at most 200 ms.
+    if not measurement_valid:
+        lost_age_ms = now_ms - int(next_state.get("last_valid_ms", -1000))
+        edge_side = int(next_state.get("last_edge_side", 0))
+        next_state["integral_deg"] = 0.0
+        if edge_side != 0 and 0 <= lost_age_ms <= 200:
+            next_state["edge_state"] = "EDGE RESCUE"
+            rescue = -edge_side * 3.5
+            next_state["last_target_deg"] = rescue
+            return rescue, next_state
+        next_state["edge_state"] = "NORMAL"
+        next_state["last_edge_side"] = 0
+        next_state["last_target_deg"] = 0.0
+        return 0.0, next_state
+
+    next_state["last_valid_ms"] = now_ms
+    if abs(error_cm) < 2.0 and abs(velocity_cm_s) < 5.0:
+        integral = (float(next_state.get("integral_deg", 0.0)) +
+                    0.08 * error_cm * dt_s)
+        next_state["integral_deg"] = max(-0.3, min(0.3, integral))
+    elif abs(error_cm) >= 3.0:
+        next_state["integral_deg"] = 0.0
+
+    if abs(error_cm) < 0.05 and abs(velocity_cm_s) < 0.3:
+        raw_target = 0.0
+    else:
+        raw_target = (0.24 * error_cm - 0.08 * velocity_cm_s +
+                      float(next_state["integral_deg"]))
+
+    absolute_position = abs(position_cm)
+    if absolute_position <= 1.0:
+        scheduled_limit = 0.3
+    elif absolute_position < 8.0:
+        scheduled_limit = 0.3 + (absolute_position - 1.0) * (1.7 / 7.0)
+    else:
+        scheduled_limit = min(5.0, 2.0 + (absolute_position - 8.0) * 0.9)
+    raw_target = max(-scheduled_limit, min(scheduled_limit, raw_target))
+
+    # Predict across camera, computation, 200 Hz inner-loop and mechanics
+    # latency, plus a conservative speed-dependent stopping distance.
+    prediction_horizon_s = 0.18
+    outward_speed = (velocity_cm_s if position_cm >= 0.0
+                     else -velocity_cm_s)
+    outward_speed = max(0.0, outward_speed)
+    stopping_distance = outward_speed * outward_speed / 200.0
+    edge_side = 1 if position_cm >= 0.0 else -1
+    predicted_position = (position_cm + velocity_cm_s * prediction_horizon_s +
+                          edge_side * stopping_distance)
+    predicted_position = max(-12.5, min(12.5, predicted_position))
+    predicted_abs = abs(predicted_position)
+
+    if absolute_position >= 11.5 or predicted_abs >= 11.5:
+        side = 1 if (predicted_position > 0.0 or position_cm > 0.0) else -1
+        rescue_strength = min(5.0, 3.2 + 0.05 * outward_speed)
+        target = -side * rescue_strength
+        next_state["edge_state"] = "EDGE RESCUE"
+        next_state["last_edge_side"] = side
+    elif absolute_position >= 10.0 or predicted_abs >= 10.0:
+        side = 1 if (predicted_position > 0.0 or position_cm > 0.0) else -1
+        inward_floor = 0.8 + min(1.7, 0.06 * outward_speed)
+        target = min(raw_target, -inward_floor) if side > 0 else max(
+            raw_target, inward_floor)
+        next_state["edge_state"] = "EDGE WARN"
+        next_state["last_edge_side"] = side
+    else:
+        target = raw_target
+        next_state["edge_state"] = "NORMAL"
+        next_state["last_edge_side"] = 0
+        max_change = 45.0 * dt_s
+        previous_target = float(next_state.get("last_target_deg", 0.0))
+        target = max(previous_target - max_change,
+                     min(previous_target + max_change, target))
+
+    target = max(-5.0, min(5.0, target))
+    next_state["last_target_deg"] = target
+    next_state["predicted_position_cm"] = predicted_position
+    return target, next_state
 
 
 class D36AStepper:
@@ -2513,21 +2641,47 @@ def axis_measurement(current_control, cal_state, task_state=None,
 
 def update_stepper_control(measurement, cascade_controller,
                            now_ms, control_timestamp_ms):
+    global ball_filter_state, outer_balance_state
     age_ms = time.ticks_diff(now_ms, control_timestamp_ms)
     vision_fresh = (
         measurement.get("valid", False) and
         age_ms >= 0 and age_ms <= STEPPER_VISION_TIMEOUT_MS)
     if vision_fresh:
-        target_angle = compute_outer_balance_target(
-            measurement.get("error_cm", 0.0),
-            measurement.get("velocity_cm_s", 0.0),
-            OUTER_BALANCE_KP_DEG_PER_CM, OUTER_BALANCE_KD_DEG_PER_CM_S,
-            OUTER_BALANCE_ANGLE_LIMIT_DEG)
+        ball_filter_state = alpha_beta_update(
+            ball_filter_state,
+            measurement.get("ball_position_cm", 0.0),
+            control_timestamp_ms)
+        filtered_position = ball_filter_state["position_cm"]
+        filtered_velocity = ball_filter_state["velocity_cm_s"]
+        filtered_error = (measurement.get("target_position_cm", 0.0) -
+                          filtered_position)
+        previous_ms = int(outer_balance_state.get("last_update_ms", now_ms))
+        dt_ms = time.ticks_diff(now_ms, previous_ms)
+        dt_s = max(0.005, min(max(dt_ms, 0) / 1000.0, 0.1))
+        target_angle, outer_balance_state = compute_outer_balance_target(
+            filtered_error, filtered_velocity, dt_s,
+            outer_balance_state, filtered_position, True, now_ms)
+        outer_balance_state["last_update_ms"] = now_ms
+        measurement["ball_position_cm"] = filtered_position
+        measurement["position_cm"] = filtered_position
+        measurement["velocity_cm_s"] = filtered_velocity
+        measurement["error_cm"] = filtered_error
     else:
-        target_angle = 0.0
+        target_angle, outer_balance_state = compute_outer_balance_target(
+            0.0, 0.0, 0.005, outer_balance_state, 0.0, False, now_ms)
+        outer_balance_state["last_update_ms"] = now_ms
+        if outer_balance_state.get("edge_state") != "EDGE RESCUE":
+            ball_filter_state = None
+    edge_rescue = outer_balance_state.get("edge_state") == "EDGE RESCUE"
+    command_valid = vision_fresh or edge_rescue
     cascade_controller.set_visual_target(
-        target_angle, control_timestamp_ms, vision_fresh)
-    return cascade_controller.status(now_ms)
+        target_angle, now_ms if edge_rescue else control_timestamp_ms,
+        command_valid)
+    status = cascade_controller.status(now_ms)
+    status["edge_state"] = outer_balance_state.get("edge_state", "NORMAL")
+    status["predicted_position_cm"] = outer_balance_state.get(
+        "predicted_position_cm", 0.0)
+    return status
 
 
 def publish_control_outputs(osd_img, capture, color_four, uart_obj, cal_state,
@@ -2765,12 +2919,19 @@ def detection():
     global kpu_validation_count, kpu_total_ms
     global blob_loss_count, kpu_reacquire_count
     global prediction_clamp_count
+    global ball_filter_state, outer_balance_state
     print("=== Ball Position (new model) ===")
     wlan = None
     stepper = None
     encoder = None
     cascade_controller = None
     encoder_runtime = None
+    ball_filter_state = None
+    outer_balance_state = {
+        "integral_deg": 0.0, "last_target_deg": 0.0,
+        "last_edge_side": 0, "last_valid_ms": -1000,
+        "edge_state": "NORMAL", "last_update_ms": time.ticks_ms(),
+    }
     # The new workflow always uses the geometric midpoint as the target;
     # there is no third-task trajectory in this mode.
     saved_calibration = {"target_param": 0.5}
