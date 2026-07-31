@@ -49,6 +49,7 @@ def test_cascade_arms_only_from_valid_absolute_calibration():
     source = ast.unparse(detection)
     assert "restore_encoder_from_absolute" in source
     assert "calibrate_encoder_zero" in source
-    assert source.count("cascade_controller.arm(") == 2
+    assert "armed=encoder_zero_restored" in source
+    assert source.count("cascade_controller.arm(") == 1
     assert "encoder_calibration['zero_abs_count']" in source
     assert "saved_encoder_calibration['zero_abs_count']" in source

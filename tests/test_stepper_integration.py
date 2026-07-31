@@ -116,6 +116,7 @@ def test_detection_wires_encoder_calibration_and_safe_cleanup_order():
     assert "restore_encoder_from_absolute" in source
     assert "RodCascadeController(" in source
     assert "save_encoder_calibration(" in source
+    assert "sample_encoder_absolute(encoder_runtime)" in source
     assert source.find("cascade_controller.deinit()") < source.find("encoder.deinit()")
     assert source.find("encoder.deinit()") < source.find("stepper.deinit()")
 

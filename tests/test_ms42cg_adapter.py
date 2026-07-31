@@ -142,6 +142,28 @@ def test_pwm_capture_collects_fixed_samples_and_produces_absolute_count():
     assert snapshot["absolute_count"] == 2048
 
 
+def test_pwm_absolute_angle_can_be_resampled_without_reregistering_irq():
+    encoder, clock = new_encoder()
+    encoder.start_pwm_capture()
+    for _ in range(5):
+        clock["us"] += 500
+        encoder.pwm_pin.edge(1)
+        clock["us"] += 500
+        encoder.pwm_pin.edge(0)
+    assert encoder.absolute_count == 2048
+    assert encoder.pwm_pin.destroyed is False
+    encoder.start_pwm_capture()
+    for _ in range(5):
+        encoder.pwm_pin.edge(1)
+        clock["us"] += 250
+        encoder.pwm_pin.edge(0)
+        clock["us"] += 750
+    assert encoder.absolute_count == 0
+    assert encoder.pwm_pin.destroyed is False
+    encoder.deinit()
+    assert encoder.pwm_pin.destroy_calls == 1
+
+
 def test_snapshot_reports_angle_and_velocity_outside_irq_context():
     encoder, _ = new_encoder()
     encoder.start_abz()

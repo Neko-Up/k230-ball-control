@@ -492,6 +492,7 @@ class MS42CGEncoder:
         self.abz_active = False
         self.abz_released = False
         self.pwm_capture_active = False
+        self.pwm_irq_registered = False
         self.pwm_pin_released = False
         self.pwm_rise_us = 0
         self.pwm_period_us = 0
@@ -540,7 +541,9 @@ class MS42CGEncoder:
         self.pwm_period_us = 0
         self.pwm_valid = False
         self.pwm_capture_active = True
-        self.pwm_pin.irq(handler=self._pwm_edge, trigger=Pin.IRQ_BOTH)
+        if not self.pwm_irq_registered:
+            self.pwm_pin.irq(handler=self._pwm_edge, trigger=Pin.IRQ_BOTH)
+            self.pwm_irq_registered = True
 
     def _pwm_edge(self, pin):
         if not self.pwm_capture_active:
@@ -569,9 +572,6 @@ class MS42CGEncoder:
 
     def stop_pwm_capture(self):
         self.pwm_capture_active = False
-        if not self.pwm_pin_released:
-            self.pwm_pin.__del__()
-            self.pwm_pin_released = True
 
     def set_zero_from_absolute(self, count):
         self.absolute_zero_count = int(count) % ENCODER_COUNTS_PER_REV
@@ -635,6 +635,9 @@ class MS42CGEncoder:
             self.z_pin.__del__()
             self.abz_released = True
         self.stop_pwm_capture()
+        if not self.pwm_pin_released:
+            self.pwm_pin.__del__()
+            self.pwm_pin_released = True
 
 
 class RodCascadeController:
@@ -3007,6 +3010,18 @@ def draw_osd(osd_img, capture, color_four, uart_obj,
 # 主入口
 # ============================================================
 
+def sample_encoder_absolute(encoder, timeout_ms=500):
+    """Capture a fresh PWM absolute angle without reallocating its GPIO IRQ."""
+    encoder.start_pwm_capture()
+    start_ms = time.ticks_ms()
+    while (encoder.pwm_capture_active and
+           time.ticks_diff(time.ticks_ms(), start_ms) < timeout_ms):
+        time.sleep_ms(1)
+    if encoder.pwm_capture_active:
+        encoder.stop_pwm_capture()
+    return encoder.snapshot(time.ticks_us())
+
+
 def detection():
     global tracker_state, control_state, motion_samples
     global pipe_state
@@ -3108,11 +3123,24 @@ def detection():
         print("D36A ready: STEP=pin13 DIR=pin11 EN=pin12 (disabled)")
         encoder = MS42CGEncoder(fpioa)
         encoder_runtime = encoder
-        encoder.start()
+        encoder.start_abz()
+        startup_encoder_snapshot = sample_encoder_absolute(encoder)
+        encoder_zero_restored = restore_encoder_from_absolute(
+            encoder, saved_encoder_calibration, startup_encoder_snapshot)
         print("MS42CG encoder ready: A=IO19 B=IO20 Z=IO32 PWM=IO33")
         cascade_controller = RodCascadeController(
-            encoder, stepper, armed=False,
-            startup_fault="ENC ZERO REQUIRED")
+            encoder, stepper, armed=encoder_zero_restored,
+            startup_fault=("ENC ZERO REQUIRED" if
+                           startup_encoder_snapshot.get("pwm_valid") else
+                           "PWM INVALID"))
+        if encoder_zero_restored:
+            cascade_controller.absolute_zero_count = (
+                saved_encoder_calibration["zero_abs_count"])
+        else:
+            balance_workflow_state.update({
+                "mode": BALANCE_WAIT_LEVEL,
+                "level_confirmed": False,
+            })
         stepper_state = cascade_controller.status(time.ticks_ms())
         if saved_rod_level is not None:
             print("Saved level exists; waiting for fresh LEVEL CONFIRM")
@@ -3149,17 +3177,6 @@ def detection():
         print("AI loop start")
 
         while True:
-            if (saved_encoder_calibration is not None and
-                    not encoder_zero_restored and encoder_runtime is not None):
-                encoder_snapshot = encoder_runtime.snapshot()
-                if restore_encoder_from_absolute(
-                        encoder_runtime, saved_encoder_calibration,
-                        encoder_snapshot):
-                    encoder_zero_restored = True
-                    cascade_controller.arm(
-                        saved_encoder_calibration["zero_abs_count"])
-                    stepper_state = cascade_controller.status(time.ticks_ms())
-                    print("MS42CG PWM zero restored; waiting for centre")
             touch_poll_counter += 1
             if touch_poll_counter >= TOUCH_POLL_EVERY_N_FRAMES:
                 touch_points = tp.read(1)
@@ -3185,7 +3202,8 @@ def detection():
                     encoder_calibration = None
                     encoder_calibration_saved = False
                     if encoder_runtime is not None:
-                        encoder_snapshot = encoder_runtime.snapshot()
+                        encoder_snapshot = sample_encoder_absolute(
+                            encoder_runtime)
                         encoder_calibration = calibrate_encoder_zero(
                             encoder_snapshot,
                             encoder_runtime.z_index_count)
