@@ -176,6 +176,17 @@ STEPPER_WATCHDOG_TIMER_ID = -1  # software timer; media pipeline owns hard timer
 STEPPER_ZERO_TOUCH_RECT = (210, 398, 380, 58)
 STEPPER_ZERO_TOUCH_EVENT = TOUCH_RELEASE_EVENT
 
+# MS42CG rod-shaft encoder: 3.3 V single-ended A/B/Z/PWM inputs.
+ENCODER_A_IO = 19
+ENCODER_B_IO = 20
+ENCODER_Z_IO = 32
+ENCODER_PWM_IO = 33
+ENCODER_COUNTS_PER_REV = 4096
+ENCODER_PWM_DUTY_MIN = 0.25
+ENCODER_PWM_DUTY_MAX = 0.75
+ENCODER_PWM_INVERT = False
+ENCODER_PWM_SAMPLE_COUNT = 8
+
 # One-touch target calibration. The official O is always pipe midpoint.
 CALIBRATION_VERSION = 2
 CALIBRATION_PATH = "/sdcard/ball_axis_calibration.json"
@@ -406,6 +417,148 @@ def compute_stepper_command(
         "motion_sign": logical_direction,
     })
     return result
+
+
+class MS42CGEncoder:
+    """Low-allocation ABZ/PWM capture adapter for the MS42CG encoder."""
+
+    def __init__(self, fpioa, ticks_us_fn=None, ticks_diff_fn=None):
+        fpioa.set_function(ENCODER_A_IO, fpioa.GPIO19, ie=1, oe=0)
+        fpioa.set_function(ENCODER_B_IO, fpioa.GPIO20, ie=1, oe=0)
+        fpioa.set_function(ENCODER_Z_IO, fpioa.GPIO32, ie=1, oe=0)
+        fpioa.set_function(ENCODER_PWM_IO, fpioa.GPIO33, ie=1, oe=0)
+        self.a_pin = Pin(ENCODER_A_IO, Pin.IN, pull=Pin.PULL_NONE)
+        self.b_pin = Pin(ENCODER_B_IO, Pin.IN, pull=Pin.PULL_NONE)
+        self.z_pin = Pin(ENCODER_Z_IO, Pin.IN, pull=Pin.PULL_NONE)
+        self.pwm_pin = Pin(ENCODER_PWM_IO, Pin.IN, pull=Pin.PULL_NONE)
+        self.ticks_us = ticks_us_fn if ticks_us_fn is not None else time.ticks_us
+        self.ticks_diff = (ticks_diff_fn if ticks_diff_fn is not None
+                           else time.ticks_diff)
+        self.count = 0
+        self.previous_ab = 0
+        self.invalid_transitions = 0
+        self.last_edge_us = 0
+        self.z_seen = False
+        self.z_index_count = None
+        self.absolute_zero_count = 0
+        self.absolute_count = None
+        self.pwm_valid = False
+        self.pwm_capture_active = False
+        self.pwm_rise_us = 0
+        self.pwm_period_us = 0
+        self.pwm_sample_index = 0
+        self.pwm_high_samples = [0] * ENCODER_PWM_SAMPLE_COUNT
+        self.pwm_period_samples = [0] * ENCODER_PWM_SAMPLE_COUNT
+        self.snapshot_count = 0
+        self.snapshot_us = 0
+        self.velocity_deg_s = 0.0
+
+    def start_abz(self):
+        self.previous_ab = ((int(self.a_pin.value()) << 1) |
+                            int(self.b_pin.value()))
+        self.a_pin.irq(handler=self._ab_edge, trigger=Pin.IRQ_BOTH)
+        self.b_pin.irq(handler=self._ab_edge, trigger=Pin.IRQ_BOTH)
+        self.z_pin.irq(handler=self._z_edge, trigger=Pin.IRQ_BOTH)
+
+    def _ab_edge(self, pin):
+        now_us = self.ticks_us()
+        current_ab = ((int(self.a_pin.value()) << 1) |
+                      int(self.b_pin.value()))
+        changed_bits = self.previous_ab ^ current_ab
+        if changed_bits == 3:
+            self.invalid_transitions += 1
+        else:
+            self.count += quadrature_delta(self.previous_ab, current_ab)
+        self.previous_ab = current_ab
+        self.last_edge_us = now_us
+
+    def _z_edge(self, pin):
+        if self.z_pin.value():
+            self.z_seen = True
+            self.z_index_count = self.count
+
+    def start_pwm_capture(self):
+        self.pwm_sample_index = 0
+        self.pwm_rise_us = 0
+        self.pwm_period_us = 0
+        self.pwm_valid = False
+        self.pwm_capture_active = True
+        self.pwm_pin.irq(handler=self._pwm_edge, trigger=Pin.IRQ_BOTH)
+
+    def _pwm_edge(self, pin):
+        if not self.pwm_capture_active:
+            return
+        now_us = self.ticks_us()
+        if self.pwm_pin.value():
+            if self.pwm_rise_us:
+                self.pwm_period_us = self.ticks_diff(now_us, self.pwm_rise_us)
+            self.pwm_rise_us = now_us
+            return
+        if not self.pwm_rise_us or self.pwm_period_us <= 0:
+            return
+        high_us = self.ticks_diff(now_us, self.pwm_rise_us)
+        index = self.pwm_sample_index
+        if index < ENCODER_PWM_SAMPLE_COUNT:
+            self.pwm_high_samples[index] = high_us
+            self.pwm_period_samples[index] = self.pwm_period_us
+            self.pwm_sample_index = index + 1
+        if self.pwm_sample_index >= ENCODER_PWM_SAMPLE_COUNT:
+            self.stop_pwm_capture()
+            high_total = sum(self.pwm_high_samples)
+            period_total = sum(self.pwm_period_samples)
+            self.absolute_count = pwm_duty_to_count(
+                high_total, period_total, ENCODER_COUNTS_PER_REV,
+                ENCODER_PWM_DUTY_MIN, ENCODER_PWM_DUTY_MAX,
+                ENCODER_PWM_INVERT)
+            self.pwm_valid = self.absolute_count is not None
+
+    def stop_pwm_capture(self):
+        self.pwm_capture_active = False
+        self.pwm_pin.irq(handler=None)
+
+    def set_zero_from_absolute(self, count):
+        self.absolute_zero_count = int(count) % ENCODER_COUNTS_PER_REV
+        if self.absolute_count is not None:
+            self.count = wrapped_encoder_delta(
+                self.absolute_count, self.absolute_zero_count,
+                ENCODER_COUNTS_PER_REV)
+        else:
+            self.count = 0
+        self.snapshot_count = self.count
+
+    def snapshot(self, now_us=None):
+        if now_us is None:
+            now_us = self.ticks_us()
+        count = self.count
+        if self.snapshot_us:
+            dt_us = self.ticks_diff(now_us, self.snapshot_us)
+            count_delta = count - self.snapshot_count
+            if 0 < dt_us <= 1000000 and abs(count_delta) <= 4096:
+                self.velocity_deg_s = (
+                    encoder_count_to_angle(count_delta,
+                                           ENCODER_COUNTS_PER_REV) *
+                    1000000.0 / dt_us)
+            else:
+                self.velocity_deg_s = 0.0
+        self.snapshot_us = now_us
+        self.snapshot_count = count
+        return {
+            "count": count,
+            "angle_deg": encoder_count_to_angle(
+                count, ENCODER_COUNTS_PER_REV),
+            "velocity_deg_s": self.velocity_deg_s,
+            "absolute_count": self.absolute_count,
+            "pwm_valid": self.pwm_valid,
+            "z_seen": self.z_seen,
+            "invalid_transitions": self.invalid_transitions,
+            "last_edge_us": self.last_edge_us,
+        }
+
+    def deinit(self):
+        self.a_pin.irq(handler=None)
+        self.b_pin.irq(handler=None)
+        self.z_pin.irq(handler=None)
+        self.stop_pwm_capture()
 
 
 class D36AStepper:

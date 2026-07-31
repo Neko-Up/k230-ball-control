@@ -24,6 +24,22 @@ def test_d36a_pin_assignment_matches_k230_header():
     assert assigned_value("STEPPER_WATCHDOG_TIMER_ID") == -1
 
 
+def test_ms42cg_uses_dedicated_input_only_header_pins():
+    assert assigned_value("ENCODER_A_IO") == 19
+    assert assigned_value("ENCODER_B_IO") == 20
+    assert assigned_value("ENCODER_Z_IO") == 32
+    assert assigned_value("ENCODER_PWM_IO") == 33
+    assert assigned_value("ENCODER_COUNTS_PER_REV") == 4096
+    encoder_class = next(
+        node for node in TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "MS42CGEncoder"
+    )
+    source = ast.unparse(encoder_class)
+    assert "Pin.IN" in source
+    assert "Pin.IRQ_BOTH" in source
+    assert "Pin.OUT" not in source
+
+
 def test_field_tuning_prioritizes_fast_edge_recovery():
     assert assigned_value("STEPPER_DIRECTION_INVERT") is True
     assert assigned_value("STEPPER_KP_ANGLE_DEG_PER_CM") == 0.55
