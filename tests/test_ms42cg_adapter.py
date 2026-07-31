@@ -36,6 +36,8 @@ class FakePin:
         return self.level
 
     def irq(self, handler=None, trigger=None):
+        if trigger is None:
+            raise TypeError("'trigger' argument required")
         self.callback = handler
         self.trigger = trigger
         return self

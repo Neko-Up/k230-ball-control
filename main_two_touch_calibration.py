@@ -491,7 +491,7 @@ class MS42CGEncoder:
 
     def stop_pwm_capture(self):
         self.pwm_capture_active = False
-        self.pwm_pin.irq(handler=None)
+        self.pwm_pin.irq(handler=None, trigger=Pin.IRQ_BOTH)
 
     def set_zero_from_absolute(self, count):
         self.absolute_zero_count = int(count) % ENCODER_COUNTS_PER_REV
@@ -532,9 +532,9 @@ class MS42CGEncoder:
         }
 
     def deinit(self):
-        self.a_pin.irq(handler=None)
-        self.b_pin.irq(handler=None)
-        self.z_pin.irq(handler=None)
+        self.a_pin.irq(handler=None, trigger=Pin.IRQ_BOTH)
+        self.b_pin.irq(handler=None, trigger=Pin.IRQ_BOTH)
+        self.z_pin.irq(handler=None, trigger=Pin.IRQ_BOTH)
         self.stop_pwm_capture()
 
 
