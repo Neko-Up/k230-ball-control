@@ -21,7 +21,6 @@ def test_d36a_pin_assignment_matches_k230_header():
     assert assigned_value("STEPPER_PWM_CHANNEL") == 0
     assert assigned_value("STEPPER_DIR_IO") == 5
     assert assigned_value("STEPPER_EN_IO") == 6
-    assert assigned_value("STEPPER_WATCHDOG_TIMER_ID") == -1
 
 
 def test_ms42cg_uses_dedicated_input_only_header_pins():
@@ -83,9 +82,7 @@ def test_d36a_adapter_owns_pwm_direction_and_active_high_enable():
     assert "self.pwm.duty(50)" in apply_text
     assert "vision_hold" not in apply_text.split("disable =", 1)[1].split(
         "self.stop", 1)[0]
-    assert "self.watchdog.init" in apply_text
-    assert "except Exception" in apply_text
-    assert "self.stop(disable=True, cancel_watchdog=False)" in apply_text
+    assert "self.watchdog" not in apply_text
     stop_text = ast.unparse(methods["stop"])
     assert ".enable(" not in stop_text
     assert "self.pwm.duty(0)" in stop_text
@@ -93,7 +90,7 @@ def test_d36a_adapter_owns_pwm_direction_and_active_high_enable():
     assert "self.en_pin.value(1)" in stop_text
 
 
-def test_stepper_watchdog_is_recreated_only_after_an_armed_timer_is_cancelled():
+def test_stepper_has_no_private_timer_watchdog():
     cls = next(
         node for node in TREE.body
         if isinstance(node, ast.ClassDef) and node.name == "D36AStepper"
@@ -102,10 +99,25 @@ def test_stepper_watchdog_is_recreated_only_after_an_armed_timer_is_cancelled():
         node.name: ast.unparse(node)
         for node in cls.body if isinstance(node, ast.FunctionDef)
     }
-    assert "self.watchdog_armed = False" in methods["__init__"]
-    assert "self.watchdog_armed = True" in methods["apply"]
-    assert "if cancel_watchdog and self.watchdog_armed" in methods["stop"]
-    assert "self.watchdog = Timer(STEPPER_WATCHDOG_TIMER_ID)" in methods["stop"]
+    assert "self.watchdog" not in methods["__init__"]
+    assert "Timer(" not in methods["__init__"]
+    assert "self.watchdog" not in methods["apply"]
+    assert "self.watchdog" not in methods["stop"]
+
+
+def test_only_cascade_controller_owns_the_software_timer():
+    cascade = next(
+        node for node in TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "RodCascadeController"
+    )
+    source = ast.unparse(cascade)
+    assert "timer_factory is not None else Timer" in source
+    assert source.count("factory(CASCADE_TIMER_ID)") == 1
+    d36a = next(
+        node for node in TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "D36AStepper"
+    )
+    assert "Timer(" not in ast.unparse(d36a)
 
 
 def test_detection_cleanup_deinitializes_stepper_before_media_cleanup():
