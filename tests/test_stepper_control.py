@@ -176,6 +176,20 @@ def test_edge_boost_requests_strong_lift_near_pipe_end():
     assert abs(result["target_angle_deg"] - 15.0) < 0.001
 
 
+def test_fast_outward_motion_at_edge_requests_full_recovery_angle():
+    result = command(
+        error_cm=12.0,
+        velocity_cm_s=-20.0,
+        kp_angle_deg_per_cm=0.55,
+        kd_angle_deg_per_cm_s=0.12,
+        edge_boost_deg_per_cm2=0.07,
+        angle_limit_deg=16.0,
+        max_frequency_hz=800.0,
+        frequency_ramp_hz_s=24000.0)
+    assert result["target_angle_deg"] == 16.0
+    assert result["frequency_hz"] > 400.0
+
+
 def test_inner_loop_tracks_target_from_estimated_angle():
     state = base_state()
     state["estimated_angle_deg"] = 0.8
