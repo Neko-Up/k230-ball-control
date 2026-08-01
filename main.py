@@ -12,8 +12,8 @@ import gc
 import time
 import uctypes
 import network
-import socket
 import _thread
+import multimedia as mm
 
 import aicube
 import image
@@ -55,7 +55,7 @@ config_path = "/sdcard/mp_deployment_source/deploy_config.json"
 debug_mode  = 0
 
 # ============================================================
-# Wi-Fi（仅联网，不启用视频推流）
+# Wi-Fi + VLC H.264/RTSP 图传
 # ============================================================
 WIFI_MODE         = "ap"       # "ap": K230 开热点；"sta": 连接现有 Wi-Fi
 WIFI_AP_SSID      = "K230_BALL"
@@ -65,14 +65,12 @@ WIFI_STA_SSID     = "YOUR_WIFI"
 WIFI_STA_PASSWORD = "YOUR_PASSWORD"
 WIFI_CONNECT_MS   = 15000
 
-MJPEG_PORT        = 8080
-MJPEG_QUALITY     = 60
+RTSP_PORT         = 8554
+RTSP_SESSION      = "ball"
+H264_BITRATE      = 1000       # Kbit/s
+H264_FPS          = 30         # 匹配摄像头/WBC，避免消费过慢形成帧积压
+H264_GOP          = 15
 
-def format_iso_time(epoch_s=None, millis=0):
-    """OSD 使用的 ISO 8601 本地时间（UTC+08:00）。"""
-    t = time.localtime() if epoch_s is None else time.localtime(epoch_s)
-    return ("%04d-%02d-%02dT%02d:%02d:%02d.%03d+08:00" %
-            (t[0], t[1], t[2], t[3], t[4], t[5], millis))
 # ============================================================
 # 状态机
 # ============================================================
@@ -93,15 +91,39 @@ MAX_DETECTIONS_PER_FRAME = 25
 PRINT_EVERY_N_FRAMES     = 30
 GC_EVERY_N_FRAMES        = 60      # 降低强制 GC 频率，减少周期性停顿
 PERF_EVERY_N_FRAMES      = 60      # 低频统计实际 AI 主循环性能
+METRICS_EVERY_N_CONTROL_FRAMES = 60
+OSD_EVERY_N_FRAMES       = 1       # 控制/UART 全帧运行，叠加层每帧刷新
 DISPLAY_LABEL            = "gz"
 MERGED_CLASS_ID          = 0       # 新模型只有 gangqiu 一个类
 MIN_BOX_SIZE             = 4
 MAX_BOX_SIZE             = 170
 MAX_ASPECT_RATIO         = 1.8
+AI_ROD_ROI               = (0, 110, 640, 140)
 DEDUP_IOU_THRESHOLD      = 0.35
 DEDUP_CENTER_RATIO       = 0.55
 TRACK_MERGE_IOU_THRESHOLD = 0.25
 TRACK_MERGE_CENTER_RATIO  = 0.75
+PREDICTION_HORIZON_MS     = 35
+PREDICTION_MIN_MS         = 20
+PREDICTION_MAX_MS         = 40
+PREDICTION_MAX_SHIFT_PX   = 16
+MOTION_RESET_JUMP_PX      = 48
+VELOCITY_REVERSAL_MIN_SPEED = 0.01
+BLOB_THRESHOLDS           = [(0, 70, -20, 20, -20, 20)]
+BLOB_GLOBAL_ROI           = (0, 110, 640, 140)
+BLOB_ROI_HALF_WIDTH       = 96
+BLOB_MIN_PIXELS           = 40
+BLOB_MAX_PIXELS           = 1600
+BLOB_MAX_ASPECT_RATIO     = 1.8
+BLOB_MAX_CENTER_DISTANCE  = 80
+TRACK_SEARCH              = "SEARCH"
+TRACK_ACTIVE              = "TRACK"
+TRACK_RECOVER             = "RECOVER"
+AI_VALIDATE_INTERVAL      = 6
+BLOB_LOST_TO_RECOVER      = 2
+AI_FAILURES_TO_RECOVER    = 2
+PREDICT_ONLY_MAX_FRAMES   = 1
+AI_BLOB_IDENTITY_MAX_DISTANCE = 80
 
 # ============================================================
 # 中值滤波
@@ -138,12 +160,448 @@ last_valid_cy     = -1
 
 tracks            = []
 frame_counter     = 0
+tracker_state     = TRACK_SEARCH
 current_deviation = {"dx": 0, "dy": 0, "valid": False, "dist_mm": 0.0}
+control_state = {
+    "x": 0, "y": 0, "vx": 0.0, "vy": 0.0,
+    "valid": False, "source": "none", "timestamp_ms": 0,
+}
+motion_samples = []
+blob_frame_count = 0
+blob_total_ms = 0
+kpu_validation_count = 0
+kpu_total_ms = 0
+blob_loss_count = 0
+kpu_reacquire_count = 0
+prediction_clamp_count = 0
 
 
 # ============================================================
 # 工具函数
 # ============================================================
+
+def estimate_velocity(samples, ticks_diff_fn=None):
+    if len(samples) < 2:
+        return 0.0, 0.0
+    velocities = []
+    for index in range(1, len(samples)):
+        x0, y0, t0 = samples[index - 1]
+        x1, y1, t1 = samples[index]
+        if ticks_diff_fn is None:
+            dt = t1 - t0
+        else:
+            dt = ticks_diff_fn(t1, t0)
+        if dt > 0:
+            velocities.append(((x1 - x0) / dt, (y1 - y0) / dt))
+    if not velocities:
+        return 0.0, 0.0
+    return (
+        sum(item[0] for item in velocities) / len(velocities),
+        sum(item[1] for item in velocities) / len(velocities),
+    )
+
+
+def is_velocity_reversal(previous_vx, previous_vy, next_vx, next_vy):
+    min_speed_sq = (
+        VELOCITY_REVERSAL_MIN_SPEED * VELOCITY_REVERSAL_MIN_SPEED)
+    previous_speed_sq = previous_vx * previous_vx + previous_vy * previous_vy
+    next_speed_sq = next_vx * next_vx + next_vy * next_vy
+    if previous_speed_sq < min_speed_sq or next_speed_sq < min_speed_sq:
+        return False
+    return previous_vx * next_vx + previous_vy * next_vy < 0
+
+
+def update_motion_history(samples, x, y, now_ms,
+                          ticks_diff_fn=None, jump_threshold=None):
+    if jump_threshold is None:
+        jump_threshold = MOTION_RESET_JUMP_PX
+    history = list(samples)
+    reset_velocity = False
+    if history:
+        previous_x, previous_y, previous_ms = history[-1]
+        delta_x = x - previous_x
+        delta_y = y - previous_y
+        if (delta_x * delta_x + delta_y * delta_y >
+                jump_threshold * jump_threshold):
+            reset_velocity = True
+        else:
+            if ticks_diff_fn is None:
+                elapsed_ms = now_ms - previous_ms
+            else:
+                elapsed_ms = ticks_diff_fn(now_ms, previous_ms)
+            if elapsed_ms > 0 and len(history) >= 2:
+                previous_vx, previous_vy = estimate_velocity(
+                    history, ticks_diff_fn)
+                next_vx = delta_x / elapsed_ms
+                next_vy = delta_y / elapsed_ms
+                reset_velocity = is_velocity_reversal(
+                    previous_vx, previous_vy, next_vx, next_vy)
+    current_sample = (x, y, now_ms)
+    if reset_velocity:
+        return [current_sample], 0.0, 0.0, True
+    history = (history + [current_sample])[-3:]
+    vx, vy = estimate_velocity(history, ticks_diff_fn)
+    return history, vx, vy, False
+
+
+def predict_position(x, y, vx, vy, horizon_ms, max_shift_px):
+    shift_x = vx * horizon_ms
+    shift_y = vy * horizon_ms
+    clamped = abs(shift_x) > max_shift_px or abs(shift_y) > max_shift_px
+    shift_x = max(-max_shift_px, min(max_shift_px, shift_x))
+    shift_y = max(-max_shift_px, min(max_shift_px, shift_y))
+    return int(round(x + shift_x)), int(round(y + shift_y)), clamped
+
+
+def hybrid_transition(state, blob_valid, ai_valid,
+                      blob_misses, ai_failures):
+    if state == TRACK_SEARCH or state == TRACK_RECOVER:
+        if ai_valid:
+            return TRACK_ACTIVE
+        return state
+    if (blob_misses >= BLOB_LOST_TO_RECOVER or
+            ai_failures >= AI_FAILURES_TO_RECOVER):
+        return TRACK_RECOVER
+    return TRACK_ACTIVE
+
+
+def ai_capture_counters(state, blob_valid, blob_misses):
+    if state != TRACK_ACTIVE or not blob_valid:
+        blob_misses = 0
+    return blob_misses, 0, 0
+
+
+def kpu_blob_identity_match(blob_x, blob_y, capture):
+    if capture is None:
+        return False
+    delta_x = capture["cx"] - blob_x
+    delta_y = capture["cy"] - blob_y
+    return (delta_x * delta_x + delta_y * delta_y <=
+            AI_BLOB_IDENTITY_MAX_DISTANCE *
+            AI_BLOB_IDENTITY_MAX_DISTANCE)
+
+
+def kpu_validation_outcome(published_control, blob_x, blob_y,
+                           capture, ai_failures):
+    valid = kpu_blob_identity_match(blob_x, blob_y, capture)
+    if valid:
+        return published_control, True, 0
+    return published_control, False, ai_failures + 1
+
+
+def apply_kpu_validation_anchor(published_control, blob_x, blob_y,
+                                capture, motion_history,
+                                jump_threshold=None):
+    if not kpu_blob_identity_match(blob_x, blob_y, capture):
+        return published_control, None, motion_history
+    if jump_threshold is None:
+        jump_threshold = MOTION_RESET_JUMP_PX
+    delta_x = capture["cx"] - blob_x
+    delta_y = capture["cy"] - blob_y
+    if (delta_x * delta_x + delta_y * delta_y >
+            jump_threshold * jump_threshold):
+        motion_history = []
+    return (
+        published_control,
+        {"x": capture["cx"], "y": capture["cy"]},
+        motion_history,
+    )
+
+
+def hybrid_frame_actions(state, frame_number, blob_available, blob_valid=True):
+    if not blob_available:
+        return ("kpu",)
+    if state != TRACK_ACTIVE:
+        return ("kpu",)
+    if not blob_valid:
+        return ("kpu",)
+    if frame_number % AI_VALIDATE_INTERVAL == 0:
+        return ("blob_control", "kpu")
+    return ("blob_control",)
+
+
+def prediction_for_missed_frame(current_state, predicted_frames, now_ms):
+    global prediction_clamp_count
+    if (not current_state["valid"] or
+            predicted_frames >= PREDICT_ONLY_MAX_FRAMES):
+        return None, predicted_frames
+    pred_x, pred_y, clamped = predict_position(
+        current_state["x"], current_state["y"],
+        current_state["vx"], current_state["vy"],
+        PREDICTION_HORIZON_MS, PREDICTION_MAX_SHIFT_PX)
+    if clamped:
+        prediction_clamp_count += 1
+    return ({
+        "x": pred_x, "y": pred_y,
+        "vx": current_state["vx"], "vy": current_state["vy"],
+        "valid": True, "source": "predict", "timestamp_ms": now_ms,
+    }, predicted_frames + 1)
+
+
+def publish_measurement(x, y, source, now_ms):
+    global control_state, motion_samples, prediction_clamp_count
+    motion_samples, vx, vy, _ = update_motion_history(
+        motion_samples, x, y, now_ms,
+        time.ticks_diff, MOTION_RESET_JUMP_PX)
+    pred_x, pred_y, clamped = predict_position(
+        x, y, vx, vy, PREDICTION_HORIZON_MS, PREDICTION_MAX_SHIFT_PX)
+    if clamped:
+        prediction_clamp_count += 1
+    control_state = {
+        "x": pred_x, "y": pred_y, "vx": vx, "vy": vy,
+        "valid": True, "source": source, "timestamp_ms": now_ms,
+    }
+
+
+def tracking_metrics_report(
+        frame_count, tracking_state, now_ms, start_ms,
+        blob_frames, blob_ms, kpu_validations, kpu_ms,
+        blob_losses, kpu_reacquires, prediction_clamps):
+    if (frame_count <= 0 or
+            frame_count % METRICS_EVERY_N_CONTROL_FRAMES != 0):
+        return None
+    elapsed_ms = time.ticks_diff(now_ms, start_ms)
+    control_fps = 0.0
+    if elapsed_ms > 0:
+        control_fps = (
+            METRICS_EVERY_N_CONTROL_FRAMES * 1000.0 / elapsed_ms)
+    blob_avg_ms = 0.0
+    if blob_frames > 0:
+        blob_avg_ms = blob_ms * 1.0 / blob_frames
+    kpu_avg_ms = 0.0
+    if kpu_validations > 0:
+        kpu_avg_ms = kpu_ms * 1.0 / kpu_validations
+    return (
+        "TRACK:{} CTRL:{:.1f} Blob:{:.1f} KPU:{:.1f} "
+        "Lost:{} Reacq:{} Clamp:{}".format(
+            tracking_state, control_fps, blob_avg_ms, kpu_avg_ms,
+            blob_losses, kpu_reacquires, prediction_clamps),
+        now_ms, 0, 0, 0, 0, 0, 0, 0,
+    )
+
+
+def reset_tracking_metrics_window(now_ms):
+    return now_ms, 0, 0, 0, 0, 0, 0, 0
+
+
+def invalidate_control_state():
+    global control_state, motion_samples
+    motion_samples = []
+    control_state = {
+        "x": 0, "y": 0, "vx": 0.0, "vy": 0.0,
+        "valid": False, "source": "none", "timestamp_ms": 0,
+    }
+
+
+def select_blob_candidate(candidates, expected_x, expected_y):
+    best_candidate = None
+    best_distance = None
+    for candidate in candidates:
+        width = candidate["w"]
+        height = candidate["h"]
+        pixels = candidate["pixels"]
+        if width <= 0 or height <= 0:
+            continue
+        if pixels < BLOB_MIN_PIXELS or pixels > BLOB_MAX_PIXELS:
+            continue
+        if max(width, height) / min(width, height) > BLOB_MAX_ASPECT_RATIO:
+            continue
+        center_x = candidate["x"] + width / 2
+        center_y = candidate["y"] + height / 2
+        distance = ((center_x - expected_x) ** 2 +
+                    (center_y - expected_y) ** 2) ** 0.5
+        if distance > BLOB_MAX_CENTER_DISTANCE:
+            continue
+        if best_distance is None or distance < best_distance:
+            best_candidate = candidate
+            best_distance = distance
+    return best_candidate
+
+
+def detect_blob_measurement(img, dynamic_roi,
+                            expected_x=None, expected_y=None):
+    blobs = img.find_blobs(
+        BLOB_THRESHOLDS,
+        roi=dynamic_roi,
+        pixels_threshold=BLOB_MIN_PIXELS,
+        area_threshold=BLOB_MIN_PIXELS,
+        merge=False)
+    candidates = []
+    for blob in blobs:
+        x, y, width, height = blob.rect()
+        candidates.append({
+            "x": x, "y": y, "w": width, "h": height,
+            "pixels": blob.pixels(),
+        })
+    if expected_x is None:
+        expected_x = dynamic_roi[0] + dynamic_roi[2] / 2
+    if expected_y is None:
+        expected_y = dynamic_roi[1] + dynamic_roi[3] / 2
+    return select_blob_candidate(candidates, expected_x, expected_y)
+
+
+def snapshot_blob_channel(sensor, should_detect, dynamic_roi,
+                          expected_x, expected_y):
+    if not should_detect:
+        return None, True
+    blob_img = None
+    try:
+        blob_img = sensor.snapshot(chn=CAM_CHN_ID_1, timeout=2000)
+        if should_detect:
+            return (detect_blob_measurement(
+                blob_img, dynamic_roi, expected_x, expected_y), True)
+        return None, True
+    except Exception as e:
+        print("Blob channel unavailable; KPU fallback active:", e)
+        return None, False
+    finally:
+        del blob_img
+
+
+def should_snapshot_blob_channel(state, blob_available):
+    return blob_available and state == TRACK_ACTIVE
+
+
+def blob_tracking_roi(expected_x):
+    global_x, global_y, global_width, global_height = BLOB_GLOBAL_ROI
+    roi_width = min(global_width, BLOB_ROI_HALF_WIDTH * 2)
+    roi_x = int(expected_x) - BLOB_ROI_HALF_WIDTH
+    roi_x = max(global_x, min(global_x + global_width - roi_width, roi_x))
+    return roi_x, global_y, roi_width, global_height
+
+
+def configure_camera_sensor(sensor, enable_blob_channel):
+    sensor.reset()
+    sensor.set_hmirror(False)
+    sensor.set_vflip(False)
+    sensor.set_framesize(width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT)
+    sensor.set_pixformat(PIXEL_FORMAT_YUV_SEMIPLANAR_420)
+    sensor.set_framesize(
+        width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
+        chn=CAM_CHN_ID_2)
+    sensor.set_pixformat(
+        PIXEL_FORMAT_RGB_888_PLANAR, chn=CAM_CHN_ID_2)
+    if enable_blob_channel:
+        sensor.set_framesize(
+            width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
+            chn=CAM_CHN_ID_1)
+        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
+    return sensor
+
+
+def create_camera_sensor(enable_blob_channel):
+    sensor = None
+    last_sensor_error = None
+    for probe_attempt in range(1, CAMERA_PROBE_RETRIES + 1):
+        try:
+            sensor = Sensor(id=CAMERA_CSI_ID, fps=30)
+            break
+        except RuntimeError as e:
+            last_sensor_error = e
+            print("Camera probe {}/{} failed: {}".format(
+                probe_attempt, CAMERA_PROBE_RETRIES, e))
+            gc.collect()
+            time.sleep_ms(1500)
+    if sensor is None:
+        raise last_sensor_error
+    try:
+        return configure_camera_sensor(sensor, enable_blob_channel)
+    except BaseException:
+        cleanup_camera_start(sensor, False, False)
+        raise
+
+
+def cleanup_camera_start(sensor, display_started, media_attempted):
+    if sensor is not None:
+        try:
+            sensor.stop(is_del=True)
+        except TypeError:
+            try:
+                sensor.stop()
+            except BaseException:
+                pass
+        except BaseException:
+            pass
+    if display_started:
+        try:
+            Display.deinit()
+        except BaseException:
+            pass
+    if media_attempted:
+        try:
+            MediaManager.deinit()
+        except BaseException:
+            pass
+
+
+def cleanup_runtime_resources(rtsp_server, sensor, tensor_holder):
+    try:
+        if rtsp_server is not None and rtsp_server.running:
+            rtsp_server.stop()
+    except BaseException:
+        pass
+    try:
+        if sensor is not None:
+            sensor.stop()
+    except BaseException:
+        pass
+    try:
+        Display.deinit()
+    except BaseException:
+        pass
+    try:
+        MediaManager.deinit()
+    except BaseException:
+        pass
+    try:
+        tensor_holder[0] = None
+    except BaseException:
+        pass
+    try:
+        gc.collect()
+    except BaseException:
+        pass
+    try:
+        nn.shrink_memory_pool()
+    except BaseException:
+        pass
+
+
+def start_camera_pipeline(enable_blob_channel):
+    sensor = None
+    display_started = False
+    media_attempted = False
+    try:
+        sensor = create_camera_sensor(enable_blob_channel)
+        sensor_bind_info = sensor.bind_info(x=0, y=0, chn=CAM_CHN_ID_0)
+        Display.bind_layer(**sensor_bind_info, layer=Display.LAYER_VIDEO1)
+        display_started = True
+        if display_mode == "lcd":
+            Display.init(Display.ST7701, to_ide=False)
+        else:
+            Display.init(Display.LT9611, to_ide=False)
+        osd_img = image.Image(
+            DISPLAY_WIDTH, DISPLAY_HEIGHT, image.ARGB8888)
+        rtsp_server = LowLatencyRtspH264Server(
+            Display.width(), Display.height(), RTSP_PORT, RTSP_SESSION)
+        media_attempted = True
+        MediaManager.init()
+        sensor.run()
+        return sensor, osd_img, rtsp_server
+    except BaseException:
+        cleanup_camera_start(sensor, display_started, media_attempted)
+        raise
+
+
+def start_camera_with_blob_fallback(start_attempt):
+    try:
+        sensor, osd_img, rtsp_server = start_attempt(True)
+        return sensor, osd_img, rtsp_server, True
+    except BaseException:
+        print("Blob channel unavailable; KPU fallback active")
+        sensor, osd_img, rtsp_server = start_attempt(False)
+        return sensor, osd_img, rtsp_server, False
+
 
 def two_side_pad_param(input_size, output_size):
     ratio_w = output_size[0] / input_size[0]
@@ -267,6 +725,38 @@ def valid_ball_box(box):
     return True
 
 
+def select_best_ai_ball(det_boxes):
+    best_capture = None
+    for det in det_boxes or []:
+        score = float(det[1])
+        x1 = float(det[2])
+        y1 = float(det[3])
+        x2 = float(det[4])
+        y2 = float(det[5])
+        width = x2 - x1
+        height = y2 - y1
+        if width < MIN_BOX_SIZE or height < MIN_BOX_SIZE:
+            continue
+        if width > MAX_BOX_SIZE or height > MAX_BOX_SIZE:
+            continue
+        if max(width, height) / min(width, height) > MAX_ASPECT_RATIO:
+            continue
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        roi_x, roi_y, roi_width, roi_height = AI_ROD_ROI
+        if (center_x < roi_x or center_x >= roi_x + roi_width or
+                center_y < roi_y or center_y >= roi_y + roi_height):
+            continue
+        if best_capture is None or score > best_capture["score"]:
+            best_capture = {
+                "box": [x1, y1, x2, y2],
+                "cx": int(center_x),
+                "cy": int(center_y),
+                "score": score,
+            }
+    return best_capture
+
+
 def smooth_box(old_box, new_box):
     a = SMOOTH_ALPHA
     return [
@@ -281,21 +771,30 @@ def smooth_box(old_box, new_box):
 # Wi-Fi
 # ============================================================
 
+def wifi_scan_channel_rssi(item):
+    if hasattr(item, "channel") and hasattr(item, "rssi"):
+        return int(item.channel), int(item.rssi)
+    if isinstance(item, dict):
+        return int(item["channel"]), int(item["rssi"])
+    return int(item[2]), int(item[3])
+
 
 def scan_best_channel():
     """
     启动时选择一次最佳2.4G信道。
-    不运行中切换，避免MJPEG断流。
+    不运行中切换，避免 RTSP 断流。
     """
+    sta = None
     try:
         sta = network.WLAN(network.STA_IF)
-        sta.active(True)
+        if not sta.active():
+            sta.active(True)
         result = sta.scan()
 
         busy = {1: 0, 6: 0, 11: 0}
 
         for item in result:
-            ssid, bssid, channel, rssi, auth, hidden = item
+            channel, rssi = wifi_scan_channel_rssi(item)
             if channel in busy:
                 # RSSI越强，占用权重越高
                 busy[channel] += max(0, 100 + rssi)
@@ -307,10 +806,18 @@ def scan_best_channel():
         print("Wi-Fi scan failed:", e)
         return 6
 
+
+def select_default_network_device(device_name):
+    if hasattr(network, "set_default_dev"):
+        if network.set_default_dev(device_name) is False:
+            raise RuntimeError(
+                "Failed to select network device {}".format(device_name))
+
 def start_wifi():
     if WIFI_MODE == "ap":
         wlan = network.WLAN(network.AP_IF)
-        wlan.active(True)
+        if not wlan.active():
+            wlan.active(True)
         try:
             ap_channel = WIFI_AP_CHANNEL
             if ap_channel == 0:
@@ -324,12 +831,14 @@ def start_wifi():
                 wlan.config(ssid=WIFI_AP_SSID,
                             password=WIFI_AP_PASSWORD)
         time.sleep_ms(500)
+        select_default_network_device("w1")
         print("Wi-Fi AP:", WIFI_AP_SSID, "password:", WIFI_AP_PASSWORD)
         print("Wi-Fi IP:", wlan.ifconfig()[0])
         return wlan
 
     wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
+    if not wlan.active():
+        wlan.active(True)
     if not wlan.isconnected():
         print("Connecting Wi-Fi:", WIFI_STA_SSID)
         wlan.connect(WIFI_STA_SSID, WIFI_STA_PASSWORD)
@@ -338,184 +847,206 @@ def start_wifi():
             if time.ticks_diff(time.ticks_ms(), start_ms) >= WIFI_CONNECT_MS:
                 raise RuntimeError("Wi-Fi connect timeout")
             time.sleep_ms(200)
+    select_default_network_device("w0")
     print("Wi-Fi connected, IP:", wlan.ifconfig()[0])
     return wlan
 
 
 # ============================================================
-# MJPEG（WBC + 硬件 JPEG）
+# VLC H.264/RTSP（WBC 合成画面 + 硬件编码）
 # ============================================================
 
-class LowLatencyMjpegServer:
-    def __init__(self, width, height, port=MJPEG_PORT):
+def rtsp_call_succeeded(result):
+    # 官方 CanMV API 返回 None；部分兼容固件沿用 C 风格的 0。
+    return result is None or result == 0
+
+
+class LowLatencyRtspH264Server:
+    def __init__(self, width, height, port=RTSP_PORT,
+                 session_name=RTSP_SESSION):
         self.width = ALIGN_UP(width, 16)
         self.height = height
         self.port = port
+        self.session_name = session_name
         self.encoder = Encoder()
         self.venc_chn = VENC_CHN_ID_0
         self.channel_api = True
+        self.rtsp = mm.rtsp_server()
         self.running = False
         self.thread_over = True
-        self.server_sock = None
-        self.client_sock = None
+        self.encoder_created = False
+        self.encoder_started = False
+        self.rtsp_initialized = False
 
         # 编码缓冲必须在 MediaManager.init() 前配置。
         try:
             self.encoder.SetOutBufs(
-                self.venc_chn, 4, self.width, self.height)
+                self.venc_chn, 16, self.width, self.height)
         except TypeError:
             self.channel_api = False
-            self.encoder.SetOutBufs(4, self.width, self.height)
+            self.encoder.SetOutBufs(16, self.width, self.height)
 
-    def start(self):
-        encoder_created = False
-        encoder_started = False
-        wbc_started = False
-        try:
-            attr = ChnAttrStr(
-                self.encoder.PAYLOAD_TYPE_JPEG, 0,
-                self.width, self.height,
-                4000, 15, 15, 15, MJPEG_QUALITY)
-            if self.channel_api:
-                self.encoder.Create(self.venc_chn, attr)
-                encoder_created = True
-                self.encoder.Start(self.venc_chn)
-            else:
-                self.encoder.Create(attr)
-                encoder_created = True
-                self.venc_chn = self.encoder.chn
-                self.encoder.Start()
-            encoder_started = True
-
-            if not WBCDisplay.writeback(True):
-                raise RuntimeError("start WBC for MJPEG failed")
-            wbc_started = True
-
-            addr = socket.getaddrinfo("0.0.0.0", self.port)[0][-1]
-            self.server_sock = socket.socket()
-            self.server_sock.setsockopt(
-                socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_sock.bind(addr)
-            self.server_sock.listen(1)
-            self.server_sock.settimeout(0.2)
-
-            self.running = True
-            self.thread_over = False
-            _thread.start_new_thread(self._serve, ())
-            print("MJPEG quality:", MJPEG_QUALITY)
-        except BaseException:
-            self.running = False
-            if self.server_sock:
-                try:
-                    self.server_sock.close()
-                except BaseException:
-                    pass
-                self.server_sock = None
-            if wbc_started:
-                WBCDisplay.writeback(False)
-            if encoder_started:
-                try:
-                    if self.channel_api:
-                        self.encoder.Stop(self.venc_chn)
-                    else:
-                        self.encoder.Stop()
-                except BaseException:
-                    pass
-            if encoder_created:
-                try:
-                    if self.channel_api:
-                        self.encoder.Destroy(self.venc_chn)
-                    else:
-                        self.encoder.Destroy()
-                except BaseException:
-                    pass
-            raise
-
-    def _encode_jpeg(self, frame_info):
-        stream = StreamData()
+    def _encoder_create(self):
+        attr = ChnAttrStr(
+            self.encoder.PAYLOAD_TYPE_H264,
+            self.encoder.H264_PROFILE_MAIN,
+            self.width, self.height,
+            bit_rate=H264_BITRATE, gopLen=H264_GOP)
         if self.channel_api:
-            ret = self.encoder.SendFrame(self.venc_chn, frame_info, 100)
+            self.encoder.Create(self.venc_chn, attr)
         else:
-            ret = self.encoder.SendFrame(frame_info, 100)
-        if ret != 0:
-            return None
+            self.encoder.Create(attr)
+            self.venc_chn = self.encoder.chn
+        self.encoder_created = True
 
+    def _encoder_start(self):
         if self.channel_api:
-            ret = self.encoder.GetStream(self.venc_chn, stream, 100)
+            self.encoder.Start(self.venc_chn)
         else:
-            ret = self.encoder.GetStream(stream, 100)
-        if ret != 0:
-            return None
+            self.encoder.Start()
+        self.encoder_started = True
 
-        parts = []
-        for i in range(stream.pack_cnt):
-            parts.append(bytes(uctypes.bytearray_at(
-                stream.data[i], stream.data_size[i])))
+    def _encoder_send_frame(self, frame_info):
+        if self.channel_api:
+            return self.encoder.SendFrame(self.venc_chn, frame_info, 100)
+        return self.encoder.SendFrame(frame_info, 100)
+
+    def _encoder_get_stream(self, stream):
+        if self.channel_api:
+            return self.encoder.GetStream(self.venc_chn, stream, 100)
+        return self.encoder.GetStream(stream, 100)
+
+    def _encoder_release_stream(self, stream):
         if self.channel_api:
             self.encoder.ReleaseStream(self.venc_chn, stream)
         else:
             self.encoder.ReleaseStream(stream)
-        return b"".join(parts)
 
-    def _serve(self):
-        header = (b"HTTP/1.1 200 OK\r\n"
-                  b"Cache-Control: no-store, no-cache\r\n"
-                  b"Connection: close\r\n"
-                  b"Content-Type: multipart/x-mixed-replace; "
-                  b"boundary=frame\r\n\r\n")
-        while self.running:
+    def _send_pack(self, stream, pack_idx):
+        send_phy = getattr(
+            self.rtsp, "rtspserver_sendvideodata_byphyaddr", None)
+        if send_phy is not None and hasattr(stream, "phy_addr"):
+            return send_phy(
+                self.session_name, stream.phy_addr[pack_idx],
+                stream.data_size[pack_idx], 1000)
+
+        # 兼容未暴露物理地址发送接口的旧固件。
+        payload = bytes(uctypes.bytearray_at(
+            stream.data[pack_idx], stream.data_size[pack_idx]))
+        return self.rtsp.rtspserver_sendvideodata(
+            self.session_name, payload, len(payload), 1000)
+
+    def _stream_loop(self):
+        frame_interval_ms = max(1, 1000 // H264_FPS)
+        next_frame_ms = time.ticks_ms()
+        try:
+            while self.running:
+                now_ms = time.ticks_ms()
+                wait_ms = time.ticks_diff(next_frame_ms, now_ms)
+                if wait_ms > 0:
+                    time.sleep_ms(wait_ms)
+                next_frame_ms = time.ticks_add(
+                    next_frame_ms, frame_interval_ms)
+
+                frame_info = WBCDisplay.writeback_dump(100)
+                if not frame_info:
+                    continue
+                if self._encoder_send_frame(frame_info) != 0:
+                    continue
+
+                stream = StreamData()
+                if self._encoder_get_stream(stream) != 0:
+                    continue
+                try:
+                    for pack_idx in range(stream.pack_cnt):
+                        self._send_pack(stream, pack_idx)
+                finally:
+                    self._encoder_release_stream(stream)
+        except BaseException as e:
+            if self.running:
+                print("RTSP stream thread stopped:", e)
+        self.thread_over = True
+
+    def get_url(self, host=None):
+        if host:
+            return "rtsp://{}:{}/{}".format(
+                host, self.port, self.session_name)
+        return self.rtsp.rtspserver_getrtspurl(self.session_name)
+
+    def start(self, host=None):
+        if self.running:
+            return
+        wbc_started = False
+        try:
+            self._encoder_create()
+            init_result = self.rtsp.rtspserver_init(self.port)
+            if not rtsp_call_succeeded(init_result):
+                raise RuntimeError("RTSP failed to bind port {}".format(
+                    self.port))
+            self.rtsp_initialized = True
+            session_result = self.rtsp.rtspserver_createsession(
+                self.session_name,
+                mm.multi_media_type.media_h264, False)
+            if not rtsp_call_succeeded(session_result):
+                raise RuntimeError("RTSP session creation failed")
+            self.rtsp.rtspserver_start()
+            self._encoder_start()
+            if not WBCDisplay.writeback(True):
+                raise RuntimeError("start WBC for RTSP failed")
+            wbc_started = True
+
+            self.running = True
+            self.thread_over = False
+            _thread.start_new_thread(self._stream_loop, ())
+            print("H264 RTSP for VLC:", self.get_url(host))
+        except BaseException:
+            self.running = False
+            if wbc_started:
+                WBCDisplay.writeback(False)
+            self._release_resources()
+            raise
+
+    def _release_resources(self):
+        if self.encoder_started:
             try:
-                client, _ = self.server_sock.accept()
-            except OSError:
-                continue
-            self.client_sock = client
-            try:
-                client.sendall(header)
-                while self.running:
-                    frame_info = WBCDisplay.writeback_dump(100)
-                    if not frame_info:
-                        continue
-                    jpg = self._encode_jpeg(frame_info)
-                    if not jpg:
-                        continue
-                    client.sendall(
-                        b"--frame\r\nContent-Type: image/jpeg\r\n" +
-                        b"Content-Length: " + str(len(jpg)).encode() +
-                        b"\r\n\r\n")
-                    client.sendall(jpg)
-                    client.sendall(b"\r\n")
-            except OSError:
-                pass
-            try:
-                client.close()
+                if self.channel_api:
+                    self.encoder.Stop(self.venc_chn)
+                else:
+                    self.encoder.Stop()
             except BaseException:
                 pass
-            self.client_sock = None
-        self.thread_over = True
+            self.encoder_started = False
+        if self.encoder_created:
+            try:
+                if self.channel_api:
+                    self.encoder.Destroy(self.venc_chn)
+                else:
+                    self.encoder.Destroy()
+            except BaseException:
+                pass
+            self.encoder_created = False
+        if self.rtsp_initialized:
+            try:
+                self.rtsp.rtspserver_stop()
+            except BaseException:
+                pass
+            try:
+                self.rtsp.rtspserver_deinit()
+            except BaseException:
+                pass
+            self.rtsp_initialized = False
 
     def stop(self):
         self.running = False
-        if self.client_sock:
-            try:
-                self.client_sock.close()
-            except BaseException:
-                pass
-        if self.server_sock:
-            try:
-                self.server_sock.close()
-            except BaseException:
-                pass
         start_ms = time.ticks_ms()
         while (not self.thread_over and
-               time.ticks_diff(time.ticks_ms(), start_ms) < 1000):
+               time.ticks_diff(time.ticks_ms(), start_ms) < 1500):
             time.sleep_ms(20)
-        WBCDisplay.writeback(False)
-        if self.channel_api:
-            self.encoder.Stop(self.venc_chn)
-            self.encoder.Destroy(self.venc_chn)
-        else:
-            self.encoder.Stop()
-            self.encoder.Destroy()
+        try:
+            WBCDisplay.writeback(False)
+        except BaseException:
+            pass
+        self._release_resources()
 
 
 # ============================================================
@@ -631,8 +1162,53 @@ def ai_to_disp(ax, ay):
 # OSD绘制
 # ============================================================
 
-def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
-    global frame_counter, state
+def detection_circle(bx, by, bw, bh):
+    cx = bx + bw // 2
+    cy = by + bh // 2
+    radius = max(4, max(bw, bh) // 2 + 3)
+    return cx, cy, radius
+
+
+def should_render_osd(frame_number, cadence=2):
+    return frame_number % cadence == 0
+
+
+def tracking_osd_color(tracking_state):
+    if tracking_state == TRACK_ACTIVE:
+        return (0, 255, 0, 255)
+    if tracking_state == TRACK_RECOVER:
+        return (0, 0, 255, 255)
+    return (0, 255, 255, 255)
+
+
+def draw_tracking_marker(osd_img, current_control, tracking_state):
+    if not current_control["valid"]:
+        return
+    marker_x, marker_y = ai_to_disp(
+        current_control["x"], current_control["y"])
+    osd_img.draw_circle(
+        marker_x, marker_y, 12,
+        color=tracking_osd_color(tracking_state), thickness=3)
+
+
+def update_servo_control(current_control):
+    # Hardware-specific servo configuration is intentionally left external.
+    return None
+
+
+def publish_control_outputs(osd_img, capture, color_four, uart_obj):
+    render_osd = should_render_osd(
+        frame_counter + 1, OSD_EVERY_N_FRAMES)
+    if render_osd:
+        osd_img.clear()
+    update_servo_control(control_state)
+    draw_osd(osd_img, capture, color_four, uart_obj, render_osd)
+    if render_osd:
+        Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
+
+
+def draw_osd(osd_img, capture, color_four, uart_obj, render_osd=True):
+    global frame_counter, state, tracker_state
     global pos_hist_full
     global calib_stable_count, calib_last_cx, calib_last_cy
     global calib_cx, calib_cy, calib_done_flash, current_deviation
@@ -649,41 +1225,16 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
 
     gc_dx, gc_dy = ai_to_disp(GEOM_CENTER_X, GEOM_CENTER_Y)
 
-    # ---- 找最佳球 ----
-    count      = 0
-    raw_cx     = -1
-    raw_cy     = -1
-    best_score = 0.0
-
-    for trk in stable_tracks:
-        if not is_visible_track(trk):
-            continue
-        x1, y1, x2, y2 = trk["box"]
-        bx, by = ai_to_disp(x1, y1)
-        bw     = int((x2 - x1) * DISPLAY_WIDTH  // OUT_RGB888P_WIDTH)
-        bh     = int((y2 - y1) * DISPLAY_HEIGHT // OUT_RGB888P_HEIGH)
-        if bw <= 0 or bh <= 0:
-            continue
-
-        col = color_four[MERGED_CLASS_ID][1:]
-        osd_img.draw_rectangle(bx, by, bw, bh, color=col, thickness=2)
-
-        tcx = int((x1 + x2) / 2)
-        tcy = int((y1 + y2) / 2)
-        lbl = DISPLAY_LABEL + ("*" if trk["lost"] > 0 else "")
-        osd_img.draw_string_advanced(bx, max(0, by - 26), 22, lbl, color=col)
-        count += 1
-        if trk["score"] > best_score:
-            best_score = trk["score"]
-            raw_cx     = tcx
-            raw_cy     = tcy
-
-    # ---- 中值滤波 ----
-    ball_valid = (raw_cx >= 0 and raw_cy >= 0)
+    ball_valid = control_state["valid"]
+    count = 1 if ball_valid else 0
+    best_score = capture["score"] if capture is not None else 0.0
+    if render_osd:
+        draw_tracking_marker(osd_img, control_state, tracker_state)
+    pos_hist_full = ball_valid
     if ball_valid:
-        filt_cx, filt_cy = median_filter_push(raw_cx, raw_cy)
+        filt_cx = control_state["x"]
+        filt_cy = control_state["y"]
     else:
-        pos_hist_full = False
         filt_cx, filt_cy = -1, -1
 
     # ============================================================
@@ -693,7 +1244,7 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
         flash_on = ((frame_counter // 15) % 2 == 0)
 
         # 在画面几何中心画准星 (仅作视觉参考)
-        if flash_on:
+        if render_osd and flash_on:
             osd_img.draw_circle(gc_dx, gc_dy, 40, color=C_GREEN, thickness=3)
             osd_img.draw_circle(gc_dx, gc_dy, 20, color=C_GREEN, thickness=2)
             osd_img.draw_line(gc_dx - 50, gc_dy, gc_dx + 50, gc_dy,
@@ -728,11 +1279,14 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
             tip_color = C_WHITE
 
         # 在球所在位置上方显示提示
-        if ball_valid and pos_hist_full:
-            bx, by = ai_to_disp(filt_cx, filt_cy)
-            osd_img.draw_string_advanced(bx - 50, by - 50, 22, tip, color=tip_color)
-        else:
-            osd_img.draw_string_advanced(gc_dx - 70, gc_dy - 80, 26, tip, color=tip_color)
+        if render_osd:
+            if ball_valid and pos_hist_full:
+                bx, by = ai_to_disp(filt_cx, filt_cy)
+                osd_img.draw_string_advanced(
+                    bx - 50, by - 50, 22, tip, color=tip_color)
+            else:
+                osd_img.draw_string_advanced(
+                    gc_dx - 70, gc_dy - 80, 26, tip, color=tip_color)
 
         # 进度条
         bar_w = 120
@@ -740,10 +1294,13 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
         bar_x = gc_dx - bar_w // 2
         bar_y = gc_dy + 70
         progress = min(1.0, calib_stable_count / CALIB_DURATION_FRAMES)
-        osd_img.draw_rectangle(bar_x, bar_y, bar_w, bar_h, color=C_WHITE, thickness=1)
-        if progress > 0:
-            fill_w = int(bar_w * progress)
-            osd_img.draw_rectangle(bar_x, bar_y, fill_w, bar_h, color=C_GREEN, thickness=-1)
+        if render_osd:
+            osd_img.draw_rectangle(
+                bar_x, bar_y, bar_w, bar_h, color=C_WHITE, thickness=1)
+            if progress > 0:
+                fill_w = int(bar_w * progress)
+                osd_img.draw_rectangle(
+                    bar_x, bar_y, fill_w, bar_h, color=C_GREEN, thickness=-1)
 
         # 校准完成
         if calib_stable_count >= CALIB_DURATION_FRAMES:
@@ -762,17 +1319,18 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
 
         if calib_done_flash > 0:
             calib_done_flash -= 1
-            if calib_done_flash % 10 < 5:
+            if render_osd and calib_done_flash % 10 < 5:
                 osd_img.draw_string_advanced(cal_dx - 50, cal_dy - 60, 28,
                     "CALIB OK!", color=C_GREEN)
 
         # 蓝色准星 (校准零点)
-        osd_img.draw_circle(cal_dx, cal_dy, 16, color=C_BLUE, thickness=2)
-        osd_img.draw_circle(cal_dx, cal_dy, 6,  color=C_BLUE, thickness=2)
-        osd_img.draw_line(cal_dx - 25, cal_dy, cal_dx + 25, cal_dy,
-                          color=C_BLUE, thickness=2)
-        osd_img.draw_line(cal_dx, cal_dy - 25, cal_dx, cal_dy + 25,
-                          color=C_BLUE, thickness=2)
+        if render_osd:
+            osd_img.draw_circle(cal_dx, cal_dy, 16, color=C_BLUE, thickness=2)
+            osd_img.draw_circle(cal_dx, cal_dy, 6,  color=C_BLUE, thickness=2)
+            osd_img.draw_line(cal_dx - 25, cal_dy, cal_dx + 25, cal_dy,
+                              color=C_BLUE, thickness=2)
+            osd_img.draw_line(cal_dx, cal_dy - 25, cal_dx, cal_dy + 25,
+                              color=C_BLUE, thickness=2)
 
         if ball_valid and pos_hist_full:
             dx = filt_cx - calib_cx
@@ -792,32 +1350,34 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
             dist_mm = total_distance_px * PIXEL_TO_MM
             current_deviation = {"dx": dx, "dy": dy, "valid": True, "dist_mm": dist_mm}
 
-            ball_dx, ball_dy = ai_to_disp(filt_cx, filt_cy)
-            osd_img.draw_line(ball_dx, ball_dy, cal_dx, cal_dy,
-                              color=C_YELLOW, thickness=1)
+            if render_osd:
+                ball_dx, ball_dy = ai_to_disp(filt_cx, filt_cy)
+                osd_img.draw_line(ball_dx, ball_dy, cal_dx, cal_dy,
+                                  color=C_YELLOW, thickness=1)
 
-            info_x = DISPLAY_WIDTH - 150
-            osd_img.draw_string_advanced(info_x, 10, 22,
-                "dX:{:+04d}".format(dx), color=C_WHITE)
-            osd_img.draw_string_advanced(info_x, 34, 22,
-                "dY:{:+04d}".format(dy), color=C_WHITE)
-            osd_img.draw_string_advanced(info_x, 60, 20,
-                "dist:{:.0f}mm".format(dist_mm), color=C_ORANGE)
+                info_x = DISPLAY_WIDTH - 150
+                osd_img.draw_string_advanced(info_x, 10, 22,
+                    "dX:{:+04d}".format(dx), color=C_WHITE)
+                osd_img.draw_string_advanced(info_x, 34, 22,
+                    "dY:{:+04d}".format(dy), color=C_WHITE)
+                osd_img.draw_string_advanced(info_x, 60, 20,
+                    "dist:{:.0f}mm".format(dist_mm), color=C_ORANGE)
 
-            osd_img.draw_string_advanced(10, 10, 22,
-                "Ball:{}".format(count), color=C_WHITE)
-            osd_img.draw_string_advanced(10, 34, 18,
-                "s:{:.2f}".format(best_score), color=C_WHITE)
+                osd_img.draw_string_advanced(10, 10, 22,
+                    "Ball:{}".format(count), color=C_WHITE)
+                osd_img.draw_string_advanced(10, 34, 18,
+                    "s:{:.2f}".format(best_score), color=C_WHITE)
         else:
             last_valid_cx = -1
             last_valid_cy = -1
             current_deviation = {"dx": 0, "dy": 0, "valid": False,
                                  "dist_mm": total_distance_px * PIXEL_TO_MM}
-            osd_img.draw_string_advanced(10, 10, 22, "Ball:0", color=C_RED)
-            osd_img.draw_string_advanced(DISPLAY_WIDTH - 150, 10, 22,
-                "dX:----", color=C_RED)
-            osd_img.draw_string_advanced(DISPLAY_WIDTH - 150, 34, 22,
-                "dY:----", color=C_RED)
+            if render_osd:
+                osd_img.draw_string_advanced(10, 10, 22, "Ball:0", color=C_RED)
+                osd_img.draw_string_advanced(DISPLAY_WIDTH - 150, 10, 22,
+                    "dX:----", color=C_RED)
+                osd_img.draw_string_advanced(DISPLAY_WIDTH - 150, 34, 22,
+                    "dY:----", color=C_RED)
 
     # ---- UART发送 ----
     if frame_counter % SEND_EVERY_N_FRAMES == 0:
@@ -842,11 +1402,12 @@ def draw_osd(osd_img, stable_tracks, color_four, uart_obj):
 # ============================================================
 
 def detection():
-    global state
+    global state, tracker_state, control_state, motion_samples
+    global blob_frame_count, blob_total_ms
+    global kpu_validation_count, kpu_total_ms
+    global blob_loss_count, kpu_reacquire_count
+    global prediction_clamp_count
     print("=== Ball Position (new model) ===")
-    print("System time:", format_iso_time(time.time(), 0))
-    if time.localtime()[0] < 2024:
-        print("WARNING: RTC time is not calibrated; displayed time is invalid")
     wlan = None
 
     deploy_conf = read_deploy_config(config_path)
@@ -896,102 +1457,231 @@ def detection():
     # ---- 摄像头 ----
     # 部分 K230 板型默认以 60 FPS 启动；显示和 AI 同时工作时
     # 会导致 snapshot chn(2) failed(3)。固定 30 FPS 可避免缓冲区耗尽。
-    time.sleep_ms(CAMERA_BOOT_DELAY_MS)
     sensor = None
-    last_sensor_error = None
-    for probe_attempt in range(1, CAMERA_PROBE_RETRIES + 1):
-        try:
-            sensor = Sensor(id=CAMERA_CSI_ID, fps=30)
-            break
-        except RuntimeError as e:
-            last_sensor_error = e
-            print("Camera probe {}/{} failed: {}".format(
-                probe_attempt, CAMERA_PROBE_RETRIES, e))
-            gc.collect()
-            time.sleep_ms(1500)
-    if sensor is None:
-        raise last_sensor_error
-    sensor.reset()
-    sensor.set_hmirror(False)
-    sensor.set_vflip(False)
-    sensor.set_framesize(width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT)
-    sensor.set_pixformat(PIXEL_FORMAT_YUV_SEMIPLANAR_420)
-    # chn0 用于 LCD，chn2 用于 AI。
-    sensor.set_framesize(width=OUT_RGB888P_WIDTH, height=OUT_RGB888P_HEIGH,
-                         chn=CAM_CHN_ID_2)
-    sensor.set_pixformat(PIXEL_FORMAT_RGB_888_PLANAR, chn=CAM_CHN_ID_2)
-
-    # ---- 显示屏 ----
-    sensor_bind_info = sensor.bind_info(x=0, y=0, chn=CAM_CHN_ID_0)
-    Display.bind_layer(**sensor_bind_info, layer=Display.LAYER_VIDEO1)
-    if display_mode == "lcd":
-        Display.init(Display.ST7701, to_ide=False)
-    else:
-        Display.init(Display.LT9611, to_ide=False)
-    osd_img = image.Image(DISPLAY_WIDTH, DISPLAY_HEIGHT, image.ARGB8888)
-    mjpeg_server = LowLatencyMjpegServer(
-        Display.width(), Display.height(), MJPEG_PORT)
-    MediaManager.init()
-    sensor.run()
-
-    print("Creating AI output tensor")
-    data = np.ones((1,3,kmodel_frame_size[1],kmodel_frame_size[0]), dtype=np.uint8)
-    ai2d_output_tensor = nn.from_numpy(data)
-    first_ai_frame = True
-    wlan = None
-    gc_frame_count = 0
-    perf_frame_count = 0
-    perf_start_ms = time.ticks_ms()
-    print("AI loop start")
-
+    rtsp_server = None
+    ai2d_output_tensor = None
+    tensor_holder = [None]
     try:
+        time.sleep_ms(CAMERA_BOOT_DELAY_MS)
+        sensor, osd_img, rtsp_server, blob_channel_available = (
+            start_camera_with_blob_fallback(start_camera_pipeline))
+
+        print("Creating AI output tensor")
+        data = np.ones(
+            (1,3,kmodel_frame_size[1],kmodel_frame_size[0]), dtype=np.uint8)
+        ai2d_output_tensor = nn.from_numpy(data)
+        tensor_holder[0] = ai2d_output_tensor
+        first_ai_frame = True
+        wlan = None
+        gc_frame_count = 0
+        perf_frame_count = 0
+        perf_start_ms = time.ticks_ms()
+        metrics_start_ms = time.ticks_ms()
+        blob_frame_count = 0
+        blob_total_ms = 0
+        kpu_validation_count = 0
+        kpu_total_ms = 0
+        blob_loss_count = 0
+        kpu_reacquire_count = 0
+        prediction_clamp_count = 0
+        blob_misses = 0
+        ai_failures = 0
+        predicted_frames = 0
+        tracker_state = TRACK_SEARCH
+        roi_anchor = {"x": control_state["x"], "y": control_state["y"]}
+        print("AI loop start")
+
         while True:
             with ScopedTiming("total", debug_mode > 0):
-                rgb888p_img = sensor.snapshot(
-                    chn=CAM_CHN_ID_2, timeout=2000)
-                if first_ai_frame:
-                    print("AI first frame OK")
-                    first_ai_frame = False
-                    # LCD、摄像头和 AI 均正常后，再尝试启动一次 Wi-Fi。
+                dynamic_roi = blob_tracking_roi(roi_anchor["x"])
+                blob_capture = None
+                if should_snapshot_blob_channel(
+                        tracker_state, blob_channel_available):
+                    blob_start_ms = time.ticks_ms()
+                    blob_capture, blob_channel_available = (
+                        snapshot_blob_channel(
+                            sensor, True,
+                            dynamic_roi,
+                            roi_anchor["x"], roi_anchor["y"]))
+                    blob_frame_count += 1
+                    blob_total_ms += time.ticks_diff(
+                        time.ticks_ms(), blob_start_ms)
+                    if not blob_channel_available:
+                        tracker_state = TRACK_SEARCH
+                        blob_misses = 0
+                        ai_failures = 0
+                        predicted_frames = 0
+                        motion_samples = []
+
+                blob_valid = blob_capture is not None
+                if (blob_channel_available and
+                        tracker_state == TRACK_ACTIVE and not blob_valid):
+                    blob_loss_count += 1
+                    blob_misses += 1
+                actions = hybrid_frame_actions(
+                    tracker_state, frame_counter + 1,
+                    blob_channel_available, blob_valid)
+                blob_measurement_x = None
+                blob_measurement_y = None
+                ai_valid = False
+
+                for action in actions:
+                    if action == "blob_control":
+                        if blob_capture is not None:
+                            blob_x = blob_capture["x"] + blob_capture["w"] // 2
+                            blob_y = blob_capture["y"] + blob_capture["h"] // 2
+                            blob_measurement_x = blob_x
+                            blob_measurement_y = blob_y
+                            publish_measurement(
+                                blob_x, blob_y, "blob", time.ticks_ms())
+                            roi_anchor = {
+                                "x": control_state["x"],
+                                "y": control_state["y"],
+                            }
+                            blob_misses = 0
+                            predicted_frames = 0
+                            # Blob control stays first on scheduled KPU
+                            # validation frames and is published only once.
+                            publish_control_outputs(
+                                osd_img, None, color_four, uart)
+                        continue
+
+                    capture = None
+                    rgb888p_img = None
+                    ai2d_input = None
+                    ai2d_input_tensor = None
+                    results = None
+                    out_data = None
+                    result = None
+                    det_boxes = None
+                    is_kpu_validation = (
+                        blob_channel_available and
+                        tracker_state == TRACK_ACTIVE and blob_valid)
                     try:
-                        wlan = start_wifi()
-                    except BaseException as e:
-                        print("Wi-Fi disabled after initialization failure:", e)
-                    if wlan is not None:
-                        try:
-                            mjpeg_server.start()
-                            print("MJPEG (with OSD): http://{}:{}/".format(
-                                wlan.ifconfig()[0], MJPEG_PORT))
-                        except BaseException as e:
-                            print("MJPEG disabled after initialization failure:", e)
-                if rgb888p_img.format() == image.RGBP888:
-                    ai2d_input = rgb888p_img.to_numpy_ref()
-                    ai2d_input_tensor = nn.from_numpy(ai2d_input)
-                    ai2d_builder.run(ai2d_input_tensor, ai2d_output_tensor)
+                        rgb888p_img = sensor.snapshot(
+                            chn=CAM_CHN_ID_2, timeout=2000)
+                        if first_ai_frame:
+                            print("AI first frame OK")
+                            first_ai_frame = False
+                            # LCD、摄像头和 AI 均正常后，再尝试启动一次 Wi-Fi。
+                            try:
+                                wlan = start_wifi()
+                            except BaseException as e:
+                                print("Wi-Fi disabled after initialization failure:", e)
+                            if wlan is not None:
+                                try:
+                                    rtsp_server.start(wlan.ifconfig()[0])
+                                except BaseException as e:
+                                    print("RTSP disabled after initialization failure:", e)
+                            (metrics_start_ms,
+                             blob_frame_count, blob_total_ms,
+                             kpu_validation_count, kpu_total_ms,
+                             blob_loss_count, kpu_reacquire_count,
+                             prediction_clamp_count) = (
+                                reset_tracking_metrics_window(
+                                    time.ticks_ms()))
 
-                    kpu.set_input_tensor(0, ai2d_output_tensor)
-                    kpu.run()
+                        if rgb888p_img.format() == image.RGBP888:
+                            if is_kpu_validation:
+                                kpu_start_ms = time.ticks_ms()
+                            ai2d_input = rgb888p_img.to_numpy_ref()
+                            ai2d_input_tensor = nn.from_numpy(ai2d_input)
+                            ai2d_builder.run(
+                                ai2d_input_tensor, ai2d_output_tensor)
 
-                    results = []
-                    for i in range(kpu.outputs_size()):
-                        out_data = kpu.get_output_tensor(i)
-                        result   = out_data.to_numpy()
-                        result   = result.reshape(
-                            result.shape[0] * result.shape[1] *
-                            result.shape[2] * result.shape[3])
+                            kpu.set_input_tensor(0, ai2d_output_tensor)
+                            kpu.run()
+
+                            results = []
+                            for i in range(kpu.outputs_size()):
+                                out_data = kpu.get_output_tensor(i)
+                                result = out_data.to_numpy()
+                                result = result.reshape(
+                                    result.shape[0] * result.shape[1] *
+                                    result.shape[2] * result.shape[3])
+                                del out_data
+                                out_data = None
+                                results.append(result)
+
+                            det_boxes = aicube.anchorbasedet_post_process(
+                                results[0], results[1], results[2],
+                                kmodel_frame_size, frame_size, strides,
+                                num_classes, DETECT_CONF_THRESHOLD,
+                                nms_threshold, anchors, nms_option)
+                            capture = select_best_ai_ball(det_boxes)
+                            if is_kpu_validation:
+                                kpu_validation_count += 1
+                                kpu_total_ms += time.ticks_diff(
+                                    time.ticks_ms(), kpu_start_ms)
+                    finally:
+                        del det_boxes
+                        del result
                         del out_data
-                        results.append(result)
+                        del results
+                        del ai2d_input_tensor
+                        del ai2d_input
+                        del rgb888p_img
 
-                    det_boxes = aicube.anchorbasedet_post_process(
-                        results[0], results[1], results[2],
-                        kmodel_frame_size, frame_size, strides,
-                        num_classes, DETECT_CONF_THRESHOLD,
-                        nms_threshold, anchors, nms_option)
+                    ai_valid = capture is not None
+                    if (ai_valid and
+                            (tracker_state == TRACK_RECOVER or
+                             (tracker_state == TRACK_ACTIVE and
+                              not blob_valid))):
+                        kpu_reacquire_count += 1
+                    validation_only = is_kpu_validation
+                    if validation_only:
+                        control_state, ai_valid, ai_failures = (
+                            kpu_validation_outcome(
+                                control_state,
+                                blob_measurement_x, blob_measurement_y,
+                                capture, ai_failures))
+                        if ai_valid:
+                            (control_state, corrected_anchor,
+                             motion_samples) = apply_kpu_validation_anchor(
+                                control_state,
+                                blob_measurement_x, blob_measurement_y,
+                                capture, motion_samples,
+                                MOTION_RESET_JUMP_PX)
+                            if corrected_anchor is not None:
+                                roi_anchor = corrected_anchor
+                            (blob_misses, ai_failures,
+                             predicted_frames) = ai_capture_counters(
+                                tracker_state, blob_valid, blob_misses)
+                    else:
+                        if ai_valid:
+                            if (tracker_state != TRACK_ACTIVE or
+                                    not blob_valid):
+                                motion_samples = []
+                            publish_measurement(
+                                capture["cx"], capture["cy"],
+                                "kpu", time.ticks_ms())
+                            roi_anchor = {
+                                "x": capture["cx"], "y": capture["cy"],
+                            }
+                            blob_misses, ai_failures, predicted_frames = (
+                                ai_capture_counters(
+                                    tracker_state, blob_valid, blob_misses))
+                        elif (blob_channel_available and
+                              tracker_state in (
+                                  TRACK_ACTIVE, TRACK_RECOVER)):
+                            ai_failures += 1
+                            predicted_state, predicted_frames = (
+                                prediction_for_missed_frame(
+                                    control_state, predicted_frames,
+                                    time.ticks_ms()))
+                            if predicted_state is None:
+                                invalidate_control_state()
+                            else:
+                                control_state = predicted_state
+                                roi_anchor = {
+                                    "x": control_state["x"],
+                                    "y": control_state["y"],
+                                }
+                        else:
+                            invalidate_control_state()
 
-                    stable_tracks = update_tracks(det_boxes)
-                    osd_img.clear()
-                    draw_osd(osd_img, stable_tracks, color_four, uart)
-                    Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
+                        publish_control_outputs(
+                            osd_img, capture, color_four, uart)
 
                     perf_frame_count += 1
                     if perf_frame_count >= PERF_EVERY_N_FRAMES:
@@ -1005,26 +1695,43 @@ def detection():
                         perf_start_ms = perf_now_ms
                         perf_frame_count = 0
 
-                    del ai2d_input_tensor
-                    gc_frame_count += 1
-                    if gc_frame_count >= GC_EVERY_N_FRAMES:
-                        gc.collect()
-                        gc_frame_count = 0
+                if blob_channel_available:
+                    tracker_state = hybrid_transition(
+                        tracker_state, blob_valid, ai_valid,
+                        blob_misses, ai_failures)
+                else:
+                    tracker_state = TRACK_SEARCH
+                    blob_misses = 0
+                    ai_failures = 0
+                    predicted_frames = 0
+
+                if (frame_counter % METRICS_EVERY_N_CONTROL_FRAMES == 0):
+                    metrics_now_ms = time.ticks_ms()
+                    (metrics_line, metrics_start_ms,
+                     blob_frame_count, blob_total_ms,
+                     kpu_validation_count, kpu_total_ms,
+                     blob_loss_count, kpu_reacquire_count,
+                     prediction_clamp_count) = tracking_metrics_report(
+                        frame_counter, tracker_state, metrics_now_ms,
+                        metrics_start_ms, blob_frame_count, blob_total_ms,
+                        kpu_validation_count, kpu_total_ms,
+                        blob_loss_count, kpu_reacquire_count,
+                        prediction_clamp_count)
+                    print(metrics_line)
+
+                gc_frame_count += 1
+                if gc_frame_count >= GC_EVERY_N_FRAMES:
+                    gc.collect()
+                    gc_frame_count = 0
 
     except KeyboardInterrupt:
         print("=== Stop ===")
     except BaseException as e:
         print("=== Runtime error ===", e)
         raise
-
-    if mjpeg_server.running:
-        mjpeg_server.stop()
-    sensor.stop()
-    Display.deinit()
-    MediaManager.deinit()
-    del ai2d_output_tensor
-    gc.collect()
-    nn.shrink_memory_pool()
+    finally:
+        ai2d_output_tensor = None
+        cleanup_runtime_resources(rtsp_server, sensor, tensor_holder)
     return 0
 
 
